@@ -3,7 +3,6 @@ module github.com/kcmvp/daos
 go 1.19
 
 require (
-	github.com/avast/retry-go v3.0.0+incompatible
 	github.com/buraksezer/consistent v0.10.0
 	github.com/cespare/xxhash v1.1.0
 	github.com/hashicorp/memberlist v0.5.0

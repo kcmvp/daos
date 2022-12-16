@@ -11,23 +11,22 @@ type index struct {
 	Version int64    `json:"version"`
 }
 
-type cmd int
+type action int
 
 const (
-	set cmd = iota
+	set action = iota
 	del
-	ttl
 )
 
-type action struct {
-	C cmd    `json:"c"`
-	K string `json:"k"`
-	V string `json:"v"`
-	T int    `json:"t"`
+type command struct {
+	A action          `json:"a"`
+	K string          `json:"k"`
+	V string          `json:"v"`
+	T []time.Duration `json:"t"`
 }
 
 type Cache interface {
-	Set(k, v string, ttl time.Duration)
+	Set(k, v string, ttl ...time.Duration) error
 	Get(k string) string
 	Del(k string) (string, error)
 	CreateJsonIndex(name, pattern string, paths ...string) error

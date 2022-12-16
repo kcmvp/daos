@@ -2,9 +2,9 @@
 // versions:
 // - protoc-gen-go-grpc v1.2.0
 // - protoc             v3.21.12
-// source: internal/daos.proto
+// source: api/daos.proto
 
-package internal
+package api
 
 import (
 	context "context"
@@ -39,7 +39,7 @@ func NewDaosClient(cc grpc.ClientConnInterface) DaosClient {
 
 func (c *daosClient) Search(ctx context.Context, in *SearchRequest, opts ...grpc.CallOption) (*SearchResponse, error) {
 	out := new(SearchResponse)
-	err := c.cc.Invoke(ctx, "/internal.Daos/Search", in, out, opts...)
+	err := c.cc.Invoke(ctx, "/api.Daos/Search", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +48,7 @@ func (c *daosClient) Search(ctx context.Context, in *SearchRequest, opts ...grpc
 
 func (c *daosClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error) {
 	out := new(GetResponse)
-	err := c.cc.Invoke(ctx, "/internal.Daos/Get", in, out, opts...)
+	err := c.cc.Invoke(ctx, "/api.Daos/Get", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +57,7 @@ func (c *daosClient) Get(ctx context.Context, in *GetRequest, opts ...grpc.CallO
 
 func (c *daosClient) Set(ctx context.Context, in *SetRequest, opts ...grpc.CallOption) (*SetResponse, error) {
 	out := new(SetResponse)
-	err := c.cc.Invoke(ctx, "/internal.Daos/Set", in, out, opts...)
+	err := c.cc.Invoke(ctx, "/api.Daos/Set", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +66,7 @@ func (c *daosClient) Set(ctx context.Context, in *SetRequest, opts ...grpc.CallO
 
 func (c *daosClient) Indexes(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*IndexResponse, error) {
 	out := new(IndexResponse)
-	err := c.cc.Invoke(ctx, "/internal.Daos/Indexes", in, out, opts...)
+	err := c.cc.Invoke(ctx, "/api.Daos/Indexes", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +123,7 @@ func _Daos_Search_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/internal.Daos/Search",
+		FullMethod: "/api.Daos/Search",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DaosServer).Search(ctx, req.(*SearchRequest))
@@ -141,7 +141,7 @@ func _Daos_Get_Handler(srv interface{}, ctx context.Context, dec func(interface{
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/internal.Daos/Get",
+		FullMethod: "/api.Daos/Get",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DaosServer).Get(ctx, req.(*GetRequest))
@@ -159,7 +159,7 @@ func _Daos_Set_Handler(srv interface{}, ctx context.Context, dec func(interface{
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/internal.Daos/Set",
+		FullMethod: "/api.Daos/Set",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DaosServer).Set(ctx, req.(*SetRequest))
@@ -177,7 +177,7 @@ func _Daos_Indexes_Handler(srv interface{}, ctx context.Context, dec func(interf
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/internal.Daos/Indexes",
+		FullMethod: "/api.Daos/Indexes",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DaosServer).Indexes(ctx, req.(*emptypb.Empty))
@@ -189,7 +189,7 @@ func _Daos_Indexes_Handler(srv interface{}, ctx context.Context, dec func(interf
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
 var Daos_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "internal.Daos",
+	ServiceName: "api.Daos",
 	HandlerType: (*DaosServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
@@ -210,5 +210,5 @@ var Daos_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
-	Metadata: "internal/daos.proto",
+	Metadata: "api/daos.proto",
 }

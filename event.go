@@ -6,16 +6,20 @@ import (
 )
 
 type event struct {
-	db *DB
+	db          *DB
+	replication *replication
 }
 
 func (evt *event) NotifyJoin(node *memberlist.Node) {
-	logger.Info("node join", zap.String("node", node.Address()))
-	evt.db.router.Add(node)
+	evt.replication.Add(node)
+	logger.Info("node join", zap.String("node", node.Address()),
+		zap.Int("num", len(evt.replication.GetMembers())), zap.Int("db nodes", evt.db.members.NumMembers()))
 }
 
 func (evt *event) NotifyLeave(node *memberlist.Node) {
-	evt.db.router.Remove(node.Address())
+	evt.replication.Remove(node.Address())
+	logger.Info("node join", zap.String("node", node.Address()),
+		zap.Int("num", len(evt.replication.GetMembers())), zap.Int("db nodes", evt.db.members.NumMembers()))
 }
 
 func (evt *event) NotifyUpdate(node *memberlist.Node) {

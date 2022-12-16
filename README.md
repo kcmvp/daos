@@ -1,1 +1,1 @@
-# dcolumn
+# Distributed array of structures (AoS)

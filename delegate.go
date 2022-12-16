@@ -12,7 +12,8 @@ import (
 )
 
 type delegate struct {
-	db *DB
+	db          *DB
+	replication *replication
 }
 
 // Create(conf *Config) -> memberlist.setAlive() -> NodeMeta(limit int) ->  m.aliveNode(&a, notifyCh, true) -> config.Alive.NotifyAlive -> encodeBroadcastNotify -> m.config.Events.NotifyJoin(&state.Node)
@@ -42,9 +43,30 @@ func (d *delegate) NodeMeta(limit int) []byte {
 // Create(conf *Config) -> newMemberlist(conf *Config)
 // 1: m.handoffCh -> go m.packetHandler() -> packetHandler(** read from net**)-> handleUser(buf []byte, from net.Addr) -> NotifyMsg(buf)
 // go m.streamListen() -> m.streamListen() -> streamListen(** read from net **)  -> handleConn(conn net.Conn) -> readUserMsg(bufConn io.Reader, dec *codec.Decoder) -> d.NotifyMsg(userBuf)
-func (db *delegate) NotifyMsg(bytes []byte) {
-	//TODO implement me
-	panic("implement me")
+func (d *delegate) NotifyMsg(bytes []byte) {
+	c := command{}
+	if err := json.Unmarshal(bytes, &c); err != nil {
+		logger.Error("incorrect user msg", zap.String("node", d.db.members.LocalNode().Address()),
+			zap.String("msg", err.Error()))
+	}
+	n, _ := d.replication.LocateKey([]byte(c.K)).(*memberlist.Node)
+	if d.db.members.LocalNode() == n {
+		switch c.A {
+		case set:
+			d.db.save(c.K, c.V, c.T...)
+		case del:
+			d.db.delete(c.K)
+		default:
+			logger.Error("incorrect command", zap.String("node", d.db.members.LocalNode().Address()),
+				zap.String("command", string(bytes)))
+		}
+	} else {
+		// in case the topology changes
+		logger.Warn("topology changes", zap.String("node", d.db.members.LocalNode().Address()),
+			zap.String("command", string(bytes)))
+		// @todo
+		// might need to save the message and broadcast the message
+	}
 }
 
 // net.handleCommand -> net.handlePing        -\
