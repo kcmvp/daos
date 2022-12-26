@@ -3,29 +3,42 @@ package daos
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/buraksezer/consistent"
-	"github.com/cespare/xxhash"
 	"github.com/hashicorp/memberlist"
+	"github.com/kcmvp/daos/internal"
 	"github.com/samber/lo"
 	lop "github.com/samber/lo/parallel"
-	"github.com/tidwall/buntdb"
 	"go.uber.org/zap"
-	"net"
+	"go.uber.org/zap/zapcore"
+	"math/rand"
+	"os"
 	"strconv"
-	"sync"
+	"strings"
 	"time"
 )
 
 const DefaultPort = 7080
-const defaultPartitionCount = 1001
-const defaultUpdateTimeout = 50 * time.Millisecond
+const DefaultUpdateTimeout = 50 * time.Millisecond
+const NotFound = "_NF_"
 
-const indexMeta = "_idx_meta_"
-const indexMetaPrefix = "_idx_:"
-const metaVersion = "version"
+type action int
 
-var logger, _ = zap.NewProduction()
+const (
+	set action = iota
+	del
+	ipcGet
+	ipcSearch
+	ipcRes
+)
 
+type Command struct {
+	Action action        `json:"a"`
+	Key    string        `json:"k"`
+	Value  string        `json:"v"`
+	TTL    time.Duration `json:"t"`
+	Seq    uint64        `json:"s"`
+	Caller string        `json:"c"`
+	Index  string        `json:"i"`
+}
 type Options struct {
 	// Local address to bind to
 	Port int
@@ -35,132 +48,321 @@ type Options struct {
 }
 
 type DB struct {
-	storage     *buntdb.DB
-	mtx         sync.RWMutex
-	members     *memberlist.Memberlist
-	broadcasts  *memberlist.TransmitLimitedQueue
-	replication *replication
+	storage    *internal.Storage
+	members    *memberlist.Memberlist
+	broadcasts *memberlist.TransmitLimitedQueue
 }
 
-func (db *DB) save(k, v string, ttl ...time.Duration) error {
-	t := 0 * time.Second
-	if len(ttl) > 0 {
-		t = ttl[0]
-	}
-	db.storage.Update(func(tx *buntdb.Tx) error {
-		if t > 0 {
-			tx.Set(k, v, &buntdb.SetOptions{
-				true,
-				t,
-			})
+func (db *DB) Ttl(k string) (time.Duration, error) {
+	return db.storage.Ttl(k)
+}
+
+func (db *DB) NodeMeta(limit int) []byte {
+	indexes, size := db.storage.Indexes()
+	idxes := lo.DropRightWhile(indexes, func(item internal.Index) bool {
+		if size > limit {
+			t, _ := json.Marshal(item)
+			size -= len(t)
+			return true
 		} else {
-			tx.Set(k, v, nil)
+			return false
 		}
-		return nil
 	})
+	data, _ := json.Marshal(idxes)
+	return data
+}
+
+func (db *DB) NotifyMsg(bytes []byte) {
+	c := Command{}
+	if err := json.Unmarshal(bytes, &c); err != nil {
+		zap.L().Error("incorrect user msg", zap.String("node", db.members.LocalNode().Address()),
+			zap.String("msg", err.Error()))
+	}
+	switch c.Action {
+	case set:
+		if db.Primary(c.Key) {
+			db.SetWithTtl(c.Key, c.Value, c.TTL)
+		} else if db.Replicas(c.Key) {
+			db.storage.Set(c.Key, c.Value, c.TTL)
+		}
+	case del:
+		if db.Primary(c.Key) {
+			db.Del(c.Key)
+		} else if db.Replicas(c.Key) {
+			db.storage.Del(c.Key)
+		}
+	case ipcGet:
+		if db.Replicas(c.Key) {
+			if v, err := db.storage.Get(c.Key); err == nil {
+				caller, err := db.node(c.Caller)
+				if err != nil {
+					zap.L().Error("can not find the node", zap.String("from", db.members.LocalNode().Name),
+						zap.String("to", c.Caller))
+					return
+				}
+				ttl, _ := db.Ttl(c.Key)
+				res := Command{
+					Action: ipcRes,
+					Key:    db.storage.IpcPrefix(c.Seq),
+					Value:  v,
+					TTL:    ttl,
+				}
+				data, _ := json.Marshal(res)
+				db.members.SendReliable(caller, data)
+			}
+		}
+	case ipcSearch:
+		m := db.storage.SearchIndex(c.Index, c.Value)
+		if len(m) == 0 {
+			m[strconv.FormatUint(c.Seq, 10)] = NotFound
+		}
+		commands := lo.MapToSlice[string, string, Command](m, func(k, v string) Command {
+			ttl, _ := db.Ttl(k)
+			return Command{
+				Action: ipcRes,
+				Key:    fmt.Sprintf("%s:%s:%s", db.storage.IpcPrefix(c.Seq), db.members.LocalNode().Name, k),
+				Value:  v,
+				TTL:    ttl,
+			}
+		})
+		data, _ := json.Marshal(commands)
+		caller, _ := db.node(c.Caller)
+		db.members.SendReliable(caller, data)
+	case ipcRes:
+		res := Command{}
+		if err := json.Unmarshal(bytes, &res); err == nil {
+			// keep the response 2 time.Millisecond
+			db.storage.Set(res.Key, res.Value, 5*time.Millisecond)
+		} else {
+			zap.L().Error("failed to unmarshal the ipc_res", zap.String("data", string(bytes)))
+		}
+	}
+}
+
+func (db *DB) node(name string) (*memberlist.Node, error) {
+	n, ok := lo.Find(db.members.Members(), func(n *memberlist.Node) bool {
+		return n.Name == name
+	})
+	if ok {
+		return n, nil
+	} else {
+		return nil, fmt.Errorf("can not find the node %s", name)
+	}
+}
+
+func (db *DB) GetBroadcasts(overhead, limit int) [][]byte {
+	return db.broadcasts.GetBroadcasts(overhead, limit)
+}
+
+func (db *DB) LocalState(join bool) []byte {
+	indexes, _ := db.storage.Indexes()
+	data, _ := json.Marshal(indexes)
+	return data
+}
+
+func (db *DB) MergeRemoteState(buf []byte, join bool) {
+	db.storage.MergeRemoteState(buf, join)
+}
+
+type broadcast struct {
+	msg    []byte
+	notify chan<- struct{}
+}
+
+func (bc *broadcast) Invalidates(b memberlist.Broadcast) bool {
+	return false
+}
+
+func (bc *broadcast) Message() []byte {
+	return bc.msg
+}
+
+func (bc *broadcast) Finished() {
+	if bc.notify != nil {
+		close(bc.notify)
+	}
+}
+
+func init() {
+	config := zap.NewProductionConfig()
+	config.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout(time.RFC3339)
+	logger, err := config.Build()
+	if err != nil {
+		logger.Warn("failed to init logger", zap.String("msg", err.Error()))
+	}
+	defer logger.Sync()
+	undo := zap.ReplaceGlobals(logger)
+	defer undo()
+}
+
+func (db *DB) Set(k, v string) error {
+	return db.SetWithTtl(k, v, 0*time.Second)
+}
+
+// SetWithTtl always set primary node first and then write to the replicas directly.
+func (db *DB) SetWithTtl(k, v string, ttl time.Duration) error {
+	var err error
+	cmd := Command{Action: set, Key: k, Value: v, TTL: ttl}
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return err
+	}
+	// make sure write to primary first
+	if db.Primary(k) {
+		err = db.storage.Set(k, v, ttl)
+		if err != nil {
+			return err
+		}
+		replicas, _ := db.storage.Replicas(k)
+		lop.ForEach(replicas, func(node *memberlist.Node, _ int) {
+			if node.Name != db.members.LocalNode().Name {
+				db.members.SendReliable(node, data)
+			}
+		})
+	} else {
+		primary, _ := db.storage.Primary(k)
+		db.members.SendReliable(primary, data)
+		zap.L().Info("redirect to primary node", zap.String("from", db.members.LocalNode().Name), zap.String("to", primary.Name))
+	}
 	return nil
 }
 
-func (db *DB) Set(k, v string, ttl ...time.Duration) error {
-	n, err := db.replication.primary(k)
-	if db.members.LocalNode() == n {
-		return db.save(k, v, ttl...)
-	} else {
-		cmd := command{set, k, v, ttl}
-		data, _ := json.Marshal(cmd)
-		nodes, _ := db.replication.replicas(k)
-		lop.ForEach(nodes, func(n *memberlist.Node, _ int) {
-			err = db.members.SendReliable(n, data)
-		})
-	}
-	return err
+func (db *DB) Replicas(key string) bool {
+	nodes, _ := db.storage.Replicas(key)
+	_, ok := lo.Find(nodes, func(item *memberlist.Node) bool {
+		return item.Name == db.members.LocalNode().Name
+	})
+	return ok
 }
 
-func (db *DB) Get(k string) string {
-	var value string
-	var err error
-	err = db.storage.View(func(tx *buntdb.Tx) error {
-		value, err = tx.Get(k)
-		return err
-	})
+func (db *DB) Primary(key string) bool {
+	n, _ := db.storage.Primary(key)
+	return n.Name == db.members.LocalNode().Name
+}
+
+func (db *DB) Get(k string) (string, error) {
+	v, err := db.storage.Get(k)
 	if err == nil {
-		return value
+		return v, nil
 	} else {
-		// @todo return from replication
-		// @todo grpc
-		panic("implement me")
+		cmd := Command{Action: ipcGet, Key: k, Seq: rand.Uint64(), Caller: db.members.LocalNode().Name}
+		data, _ := json.Marshal(cmd)
+		primary, _ := db.storage.Primary(k)
+		db.members.SendReliable(primary, data)
+		return func(c Command) (string, error) {
+			var v1 string
+			var err1 error
+			tries, duration, _ := lo.AttemptWithDelay(5, 200*time.Microsecond, func(_ int, d time.Duration) error {
+				v1, err1 = db.storage.Get(db.storage.IpcPrefix(c.Seq))
+				return err
+			})
+			if err != nil {
+				zap.L().Error("[redirect]: ipc_get", zap.String("node", db.members.LocalNode().Address()),
+					zap.String("remote", primary.Address()))
+			} else {
+				zap.L().Info("[redirect]: ipc_get", zap.String("node", db.members.LocalNode().Address()),
+					zap.String("remote", primary.Address()), zap.Int("tries", tries),
+					zap.Int64("duration(Microsecond)", int64(duration)/int64(time.Microsecond)))
+			}
+			// @todo update local node when applicable
+			return v1, err1
+		}(cmd)
 	}
 }
 
-func (db *DB) delete(k string) (string, error) {
-	var v string
-	var err error
-	err = db.storage.Update(func(tx *buntdb.Tx) error {
-		v, err = tx.Delete(k)
-		return err
+func (db *DB) Search(index, criteria string) (map[string]string, error) {
+	// send ipc_search request to the cluster
+	cmd := Command{
+		Action: ipcSearch,
+		Index:  index,
+		Value:  criteria,
+		Caller: db.members.LocalNode().Name,
+		Seq:    rand.Uint64()}
+	data, _ := json.Marshal(&cmd)
+	lop.ForEach(db.members.Members(), func(r *memberlist.Node, _ int) {
+		if r.Name != db.members.LocalNode().Name {
+			db.members.SendReliable(r, data)
+		}
 	})
-	return v, err
-}
-
-func (db *DB) Del(k string) (string, error) {
-	var v string
-	var err error
-	n, _ := db.replication.LocateKey([]byte(k)).(*memberlist.Node)
-	if db.members.LocalNode() == n {
-		v, err = db.delete(k)
+	// ipc_get remote result
+	return func(c Command) (map[string]string, error) {
+		lr := db.storage.SearchIndex(c.Index, c.Value)
+		rr := map[string]string{}
+		_, _, err := lo.AttemptWithDelay(6, 300*time.Microsecond, func(_ int, d time.Duration) error {
+			rt := db.storage.ScanIPC(c.Seq)
+			nm := map[string]int{}
+			for _k, v := range rt {
+				ks := strings.Split(_k, ":")
+				n := ks[len(ks)-2]
+				nm[n] = 1
+				k := ks[len(ks)-1]
+				if strconv.FormatUint(c.Seq, 10) != k && v != NotFound {
+					p, _ := db.storage.Primary(k)
+					_, ok := rr[k]
+					if p.Name == n || !ok {
+						rr[k] = v
+					}
+				}
+			}
+			if len(nm)+1 == len(db.members.Members()) {
+				return nil
+			}
+			return fmt.Errorf("time out")
+		})
 		if err != nil {
-			logger.Error("failed to delete key", zap.String("node", db.members.LocalNode().Address()), zap.String("key", k))
+			rr = map[string]string{}
+		} else {
+			for k, v := range lr {
+				if _v, ok := rr[k]; !ok {
+					rr[k] = v
+				} else if v != _v {
+					n, _ := db.storage.Primary(k)
+					if n.Name == db.members.LocalNode().Name {
+						rr[k] = v
+					} else {
+						// update the latest
+						// @todo update local node when applicable
+						// @todo need to ipc_get ttl of the key
+					}
+				}
+			}
 		}
+		return rr, err
+	}(cmd)
+}
+
+func (db *DB) Del(k string) {
+	cmd := Command{Action: del, Key: k}
+	data, _ := json.Marshal(cmd)
+	if db.Primary(k) {
+		db.storage.Del(k)
+		replicas, _ := db.storage.Replicas(k)
+		lop.ForEach(replicas, func(node *memberlist.Node, _ int) {
+			if node.Name != db.members.LocalNode().Name {
+				db.members.SendReliable(node, data)
+			}
+		})
+	} else {
+		primary, _ := db.storage.Primary(k)
+		db.members.SendReliable(primary, data)
 	}
-	nodes, err := db.replication.replicas(k)
-	cmd := command{A: del, K: k}
-	d, _ := json.Marshal(cmd)
-	lop.ForEach(nodes, func(m *memberlist.Node, _ int) {
-		if err = db.members.SendReliable(n, d); err != nil {
-			logger.Error("failed to send delete command", zap.String("node", db.members.LocalNode().Address()),
-				zap.String("msg", err.Error()))
-		}
-	})
-	return v, err
 }
 
 func (db *DB) CreateJsonIndex(name, pattern string, paths ...string) error {
-	names, err := db.storage.Indexes()
+	now := time.Now()
+	index := internal.Index{
+		Name:    name,
+		Key:     pattern,
+		Paths:   paths,
+		Version: now.Unix(),
+	}
+	err := db.storage.CreateIndex(index)
 	if err != nil {
 		return err
 	}
-	_, ok := lo.Find[string](names, func(n string) bool {
-		return n == name
-	})
-	if ok {
-		logger.Warn("index exists", zap.String("node", db.members.LocalNode().Address()),
-			zap.String("index", name))
-		return fmt.Errorf("index %s exists", name)
-	}
-	idxes := lo.Map[string, func(a, b string) bool](paths, func(p string, _ int) func(a, b string) bool {
-		return buntdb.IndexJSON(p)
-	})
-	db.storage.CreateIndex(name, pattern, idxes...)
-	idx := &index{name, pattern, []string{}, time.Now().Unix()}
-	lo.ForEach(paths, func(p string, _ int) {
-		idx.Paths = append(idx.Paths, p)
-	})
-
-	data, err := json.Marshal(idx)
+	err = db.members.UpdateNode(DefaultUpdateTimeout)
 	if err != nil {
-		return err
-	}
-	db.storage.CreateIndex(indexMeta, fmt.Sprintf("%s*", indexMetaPrefix), buntdb.IndexJSON(metaVersion))
-	err = db.storage.Update(func(tx *buntdb.Tx) error {
-		tx.Set(fmt.Sprintf("%s%s", indexMetaPrefix, name), string(data), nil)
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	err = db.members.UpdateNode(defaultUpdateTimeout)
-	if err != nil {
-		logger.Error("failed to broadcast index message", zap.String("node", db.members.LocalNode().Address()))
+		zap.L().Error("failed to broadcast index creation", zap.String("node", db.members.LocalNode().Address()))
 	}
 	return err
 }
@@ -170,84 +372,41 @@ func (db *DB) DropIndex(name string) error {
 	if err != nil {
 		return err
 	}
-	err = db.storage.Update(func(tx *buntdb.Tx) error {
-		_, err = tx.Delete(fmt.Sprintf("%s%s", indexMetaPrefix, name))
-		return err
-	})
+	err = db.members.UpdateNode(DefaultUpdateTimeout)
 	if err != nil {
-		return err
-	}
-	err = db.members.UpdateNode(defaultUpdateTimeout)
-	if err != nil {
-		logger.Error("failed to delete the index", zap.String("node", db.members.LocalNode().Address()),
+		zap.L().Error("failed to broadcast index deletion", zap.String("node", db.members.LocalNode().Address()),
 			zap.String("index", name))
 	}
 	return err
 }
 
-func (db *DB) SearchIndexBy(index string, value string) map[string]string {
-	db.storage.View(func(tx *buntdb.Tx) error {
-		return tx.AscendEqual(index, value, func(key, value string) bool {
-			return true
-		})
-	})
-	panic("board cast")
-}
-
 func NewDB(opt Options) (*DB, error) {
-	db := new(DB)
-	ifs, err := net.Interfaces()
-	if err != nil {
-		logger.Error("failed to get ip", zap.String("db", "_"), zap.String("cause", err.Error()))
-		return nil, err
-	}
-	var ip net.IP
-	for _, i := range ifs {
-		if addrs, err := i.Addrs(); err == nil {
-			// handle err
-			for _, addr := range addrs {
-				switch v := addr.(type) {
-				case *net.IPNet:
-					ip = v.IP
-				case *net.IPAddr:
-					ip = v.IP
-				}
-			}
-		}
-	}
-	storage, err := buntdb.Open(":memory:")
-	if err != nil {
-		logger.Error("failed to create database", zap.String("db", ip.String()), zap.String("cause", err.Error()))
-		return nil, err
-	}
-	db.storage = storage
+
+	hostname, _ := os.Hostname()
 	cfg := memberlist.DefaultLocalConfig()
-	cfg.BindPort = func() int {
-		if opt.Port > 0 {
-			return opt.Port
-		} else {
-			return DefaultPort
-		}
-	}()
-	cfg.Name = net.JoinHostPort(ip.String(), strconv.Itoa(cfg.BindPort))
-
-	replicas := &replication{
-		opt.Replicas,
-		consistent.New(nil, consistent.Config{
-			PartitionCount: defaultPartitionCount,
-			Hasher:         &hash{},
-		}),
+	if opt.Port > 0 {
+		cfg.BindPort = opt.Port
+	} else {
+		cfg.BindPort = DefaultPort
 	}
-	db.replication = replicas
-	cfg.Events = &event{db, replicas}
-	cfg.Delegate = &delegate{db, replicas}
 
+	cfg.Name = fmt.Sprintf("%storage-%d", hostname, cfg.BindPort)
+
+	storage, err := internal.NewStorage(opt.Replicas)
+	if err != nil {
+		return nil, err
+	}
+
+	db := new(DB)
+	db.storage = storage
+
+	cfg.Events = &event{storage}
+	cfg.Delegate = db
 	members, err := memberlist.Create(cfg)
 	if err != nil {
 		return nil, err
 	}
-
-	// add db to members
+	// add node to cluster
 	if len(opt.Nodes) > 0 {
 		members.Join(opt.Nodes)
 	}
@@ -262,12 +421,5 @@ func NewDB(opt Options) (*DB, error) {
 	return db, nil
 }
 
-type hash struct{}
-
-func (h hash) Sum64(bytes []byte) uint64 {
-	return xxhash.Sum64(bytes)
-}
-
-// interface guard
-var _ consistent.Hasher = (*hash)(nil)
 var _ Cache = (*DB)(nil)
+var _ memberlist.Broadcast = (*broadcast)(nil)
