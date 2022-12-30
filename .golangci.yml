@@ -1,0 +1,39 @@
+# Don't remove below line, it controls the version of golangci-linter at runtime.
+run:
+  tests: false
+  skip-dirs:
+    - scripts
+output:
+  sort-results: true
+linters:
+  enable-all: false
+  enable:
+    - deadcode
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    #    - typecheck
+    - unused
+    - varcheck
+    - gosec
+    #    - gofumpt
+    - nosnakecase
+    - goconst
+  presets:
+    - bugs
+    - comment
+    - complexity
+    - error
+    - format
+    #    - import // goimports would cause some issues when in Golang
+    - metalinter
+    - module
+    - performance
+    - sql
+    #    - style
+    #    - test
+    - unused
+issues:
+  fix: false

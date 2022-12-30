@@ -1,37 +1,58 @@
 package internal
 
 import (
-	"encoding/json"
 	"fmt"
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
 	"github.com/hashicorp/memberlist"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/samber/lo"
 	"github.com/tidwall/buntdb"
-	"go.uber.org/zap"
+	"log"
 	"strings"
 	"time"
 )
 
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
 const defaultPartitionCount = 1001
-const indexIndexName = "_idx_meta_"
-const indexPrefix = "_idx_:"
+const indexIndexName = "_meta_"
+const indexNamePrefix = "_idx_:"
 const indexVersion = "version"
 
-const ipcIndexName = "_idx_ipc"
-const ipcKeyPrefix = "_ipc_:"
+const remoteResIndexName = "_ipc_"
+const remoteResKeyPrefix = "_ipc_:"
+
+func ReversedIndex() []string {
+	return []string{indexIndexName, remoteResIndexName}
+}
+
+func ReversedBucket() []string {
+	return []string{indexNamePrefix, remoteResKeyPrefix}
+}
+
+type IdxMeta struct {
+	Name     string   `json:"name"`
+	Bucket   string   `json:"key"`
+	JsonPath []string `json:"paths"`
+	Version  int64    `json:"version"`
+}
 
 type Storage struct {
 	db       *buntdb.DB
 	replicas int
+	logger   *log.Logger
 	*consistent.Consistent
 }
 
-type Index struct {
-	Name    string   `json:"name"`
-	Key     string   `json:"key"`
-	Paths   []string `json:"paths"`
-	Version int64    `json:"version"`
+type Response struct {
+	Key   string        `json:"k,omitempty"`
+	Value string        `json:"v,omitempty"`
+	TTL   time.Duration `json:"t,omitempty"`
+}
+
+func remoteKey(seq uint32, key string) string {
+	return fmt.Sprintf("%s%d:%s", remoteResKeyPrefix, seq, key)
 }
 
 func (s *Storage) Set(k, v string, ttl time.Duration) error {
@@ -47,12 +68,21 @@ func (s *Storage) Set(k, v string, ttl time.Duration) error {
 	return err
 }
 
+func (s *Storage) SetRemote(seq uint32, k, v string, ttl time.Duration) error {
+	key := remoteKey(seq, k)
+	return s.Set(key, v, ttl)
+}
+
 func (s *Storage) Get(k string) (v string, err error) {
 	s.db.View(func(tx *buntdb.Tx) error {
 		v, err = tx.Get(k, false)
 		return err
 	})
 	return v, err
+}
+
+func (s *Storage) GetRemote(seq uint32, k string) (v string, err error) {
+	return s.Get(remoteKey(seq, k))
 }
 
 func (s *Storage) Ttl(k string) (time.Duration, error) {
@@ -65,38 +95,47 @@ func (s *Storage) Ttl(k string) (time.Duration, error) {
 	return ttl, err
 }
 
-func (s *Storage) IpcPrefix(seq uint64) string {
-	return fmt.Sprintf("%s%d", ipcKeyPrefix, seq)
-}
-
-func (s *Storage) SearchIndex(index, criteria string) map[string]string {
-	rsm := map[string]string{}
+func (s *Storage) SearchIndex(index, criteria string) []Response {
+	var resp []Response
 	s.db.View(func(tx *buntdb.Tx) error {
 		tx.AscendEqual(index, criteria, func(key, value string) bool {
-			rsm[key] = value
+			ttl, _ := tx.TTL(key)
+			r := Response{
+				Key:   key,
+				Value: value,
+				TTL:   ttl,
+			}
+			resp = append(resp, r)
 			return true
 		})
 		return nil
 	})
-	return rsm
+	return resp
 }
 
-func (s *Storage) ScanIPC(seq uint64) map[string]string {
-	return s.ScanIndex(ipcIndexName, s.IpcPrefix(seq))
-}
-
-func (s *Storage) ScanIndex(index, prefix string) map[string]string {
-	rsm := map[string]string{}
+func (s *Storage) ScanIndex(index, indexPrefix string) []Response {
+	var resp []Response
 	s.db.View(func(tx *buntdb.Tx) error {
 		tx.Ascend(index, func(key, value string) bool {
-			if strings.HasPrefix(key, prefix) {
-				rsm[key] = value
+			if strings.HasPrefix(key, indexPrefix) {
+				ttl, _ := tx.TTL(key)
+				r := Response{
+					Key:   key,
+					Value: value,
+					TTL:   ttl,
+				}
+				resp = append(resp, r)
 			}
 			return true
 		})
 		return nil
 	})
-	return rsm
+	return resp
+}
+
+func (s *Storage) ScanIndexRemote(seq uint32) []Response {
+	prefix := fmt.Sprintf("%s%d", remoteResKeyPrefix, seq)
+	return s.ScanIndex(remoteResIndexName, prefix)
 }
 
 func (s *Storage) Del(k string) (v string, err error) {
@@ -107,12 +146,12 @@ func (s *Storage) Del(k string) (v string, err error) {
 	return
 }
 
-func (s *Storage) Indexes() ([]Index, int) {
-	var indexes []Index
+func (s *Storage) Indexes() ([]IdxMeta, int) {
+	var indexes []IdxMeta
 	var size int
 	s.db.View(func(tx *buntdb.Tx) error {
 		tx.Ascend(indexIndexName, func(k, v string) bool {
-			index := Index{}
+			index := IdxMeta{}
 			size += len(v)
 			json.Unmarshal([]byte(v), &index)
 			indexes = append(indexes, index)
@@ -123,20 +162,22 @@ func (s *Storage) Indexes() ([]Index, int) {
 	return indexes, size
 }
 
-func (s *Storage) CreateIndex(index Index) error {
+func (s *Storage) CreateIndex(index IdxMeta) error {
 	var err error
-	s.DropIndex(index.Name)
 	err = s.db.Update(func(tx *buntdb.Tx) error {
-		var data []byte
-		jsonIndex := lo.Map[string, func(a, b string) bool](index.Paths, func(p string, _ int) func(a, b string) bool {
+		//var data []byte
+		jsonIndex := lo.Map[string, func(a, b string) bool](index.JsonPath, func(p string, _ int) func(a, b string) bool {
 			return buntdb.IndexJSON(p)
 		})
-		err = tx.CreateIndex(index.Name, index.Key, jsonIndex...)
-		data, err = json.Marshal(index)
+		err = tx.CreateIndex(index.Name, index.Bucket, jsonIndex...)
 		if err != nil {
 			return err
 		}
-		_, _, err = tx.Set(fmt.Sprintf("%s%s", indexPrefix, index.Name), string(data), nil)
+		data, err := json.Marshal(index)
+		if err != nil {
+			return err
+		}
+		_, _, err = tx.Set(fmt.Sprintf("%s%s", indexNamePrefix, index.Name), string(data), nil)
 		return err
 	})
 	return err
@@ -149,55 +190,60 @@ func (s *Storage) DropIndex(name string) error {
 		if err != nil {
 			return err
 		}
-		_, err = tx.Delete(fmt.Sprint("%s%s", indexPrefix, name))
+		_, err = tx.Delete(fmt.Sprintf("%s%s", indexNamePrefix, name))
 		return err
 	})
 	return err
 }
 
 func (s *Storage) MergeRemoteState(buf []byte, join bool) {
-	var indexes []Index
-	var existing []Index
+	var indexes []IdxMeta
+	var existing []IdxMeta
 	json.Unmarshal(buf, &indexes)
-	lo.ForEach(indexes, func(item Index, _ int) {
-		v, err := s.Get(fmt.Sprintf("%s%s", indexPrefix, item.Name))
-		var idx Index
+	lo.ForEach(indexes, func(item IdxMeta, _ int) {
+		v, err := s.Get(fmt.Sprintf("%s%s", indexNamePrefix, item.Name))
+		var idx IdxMeta
 		if err == nil {
 			json.Unmarshal([]byte(v), &idx)
 			existing = append(existing, idx)
 		}
 	})
-	var update []Index
-	lo.ForEach(indexes, func(r Index, _ int) {
-		f := lo.ContainsBy(existing, func(e Index) bool {
+	var update []IdxMeta
+	lo.ForEach(indexes, func(r IdxMeta, _ int) {
+		f := lo.ContainsBy(existing, func(e IdxMeta) bool {
 			return r.Name == e.Name && r.Version <= e.Version
 		})
 		if !f {
 			update = append(update, r)
 		}
 	})
-	lo.ForEach(update, func(i Index, _ int) {
+	lo.ForEach(update, func(i IdxMeta, _ int) {
 		s.CreateIndex(i)
 	})
 
 }
-func NewStorage(replicas int) (*Storage, error) {
+func NewStorage(replicas int, logger *log.Logger) (*Storage, error) {
 	db, err := buntdb.Open(":memory:")
 	if err != nil {
-		zap.L().Error("failed to create s", zap.String("cause", err.Error()))
+		logger.Printf("failed to create db %s \n", err.Error())
 		return nil, err
 	}
 	err = db.Update(func(tx *buntdb.Tx) error {
-		tx.CreateIndex(ipcIndexName, fmt.Sprintf("%s*", ipcKeyPrefix), buntdb.IndexString)
-		return tx.CreateIndex(indexIndexName, fmt.Sprintf("%s*", indexPrefix), buntdb.IndexJSON(indexVersion))
+		err = tx.CreateIndex(remoteResIndexName, fmt.Sprintf("%s*", remoteResKeyPrefix), buntdb.IndexString)
+		if err != nil {
+			return err
+		}
+		err = tx.CreateIndex(indexIndexName, fmt.Sprintf("%s*", indexNamePrefix), buntdb.IndexJSON(indexVersion))
+		return err
 	})
 	if err != nil {
-		panic("failed to init database")
+		panic(fmt.Sprintf("failed to init database %s", err.Error()))
 	}
 	s := &Storage{
-		db,
-		replicas,
-		consistent.New(nil, consistent.Config{
+		db:       db,
+		replicas: replicas,
+		logger:   logger,
+		Consistent: consistent.New(nil, consistent.Config{
 			PartitionCount: defaultPartitionCount,
 			Hasher:         &hash{},
 		}),
@@ -205,27 +251,26 @@ func NewStorage(replicas int) (*Storage, error) {
 	return s, nil
 }
 
-func (r *Storage) Primary(k string) (*memberlist.Node, error) {
-	n, ok := r.LocateKey([]byte(k)).(*memberlist.Node)
+func (s *Storage) Primary(k string) (*memberlist.Node, error) {
+	n, ok := s.LocateKey([]byte(k)).(*memberlist.Node)
 	if ok {
 		return n, nil
 	} else {
-		return nil, fmt.Errorf("failed to get the primay node of key")
+		return nil, fmt.Errorf("failed to get the primay cluster of key")
 	}
 }
 
-func (r *Storage) Replicas(k string) ([]*memberlist.Node, error) {
+func (s *Storage) Replicas(k string) ([]*memberlist.Node, error) {
 	var nodes []*memberlist.Node
-	members, err := r.GetClosestN([]byte(k), r.replicas)
+	members, err := s.GetClosestN([]byte(k), s.replicas)
 	if err != nil {
-		zap.L().Error("failed to get replicated node of key", zap.String("key", k))
+		s.logger.Printf("failed to get replicated cluster of key %s \n", k)
 	}
 	nodes = lo.Map[consistent.Member, *memberlist.Node](members, func(m consistent.Member, index int) *memberlist.Node {
 		v, _ := m.(*memberlist.Node)
 		return v
 	})
 	return nodes, err
-
 }
 
 type hash struct{}
