@@ -3,21 +3,18 @@ package daos
 import (
 	"fmt"
 	"github.com/hashicorp/memberlist"
-	jsoniter "github.com/json-iterator/go"
 	"github.com/kcmvp/daos/internal"
 	"github.com/samber/lo"
 	lop "github.com/samber/lo/parallel"
+	"github.com/vmihailenco/msgpack/v5"
 	"log"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 )
 
-const DefaultPort = 7080
-
 type action int
-
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 const (
 	set action = iota
@@ -28,6 +25,10 @@ const (
 	createIndex
 	dropIndex
 )
+
+const DefaultPort = 7080
+
+var chanMap sync.Map
 
 type Command struct {
 	Action action        `json:"a,omitempty"`
@@ -43,15 +44,17 @@ type cluster struct {
 	storage    *internal.Storage
 	members    *memberlist.Memberlist
 	broadcasts *memberlist.TransmitLimitedQueue
-	logger     *log.Logger
+	options    Options
 }
 
+func (dc *cluster) Logger() *log.Logger {
+	return dc.options.Logger
+}
+func (dc *cluster) Timeout() time.Duration {
+	return dc.options.Timeout
+}
 func (dc *cluster) Shutdown() {
 	dc.members.Shutdown()
-}
-
-func (dc *cluster) Ttl(k string) (time.Duration, error) {
-	return dc.storage.Ttl(k)
 }
 
 func (dc *cluster) NodeMeta(limit int) []byte {
@@ -61,54 +64,51 @@ func (dc *cluster) NodeMeta(limit int) []byte {
 	indexes, size := dc.storage.Indexes()
 	idxes := lo.DropRightWhile(indexes, func(item internal.IdxMeta) bool {
 		if size > limit {
-			t, _ := json.Marshal(item)
+			t, _ := msgpack.Marshal(item)
 			size -= len(t)
 			return true
 		} else {
 			return false
 		}
 	})
-	data, _ := json.Marshal(idxes)
+	data, _ := msgpack.Marshal(idxes)
 	return data
 }
 
 func (dc *cluster) NotifyMsg(bytes []byte) {
 	fmt.Printf("**NotifyMsg %s\n\n", dc.members.LocalNode().Name)
 	cmd := Command{}
-	if err := json.Unmarshal(bytes, &cmd); err != nil {
-		dc.logger.Printf("incorrect user msg %s \n", err.Error())
+	if err := msgpack.Unmarshal(bytes, &cmd); err != nil {
+		dc.options.Logger.Printf("incorrect user msg %s \n", err.Error())
 		return
 	}
 	switch cmd.Action {
 	case set:
-		//if dc.Primary(cmd.Key) {
-		//	dc.SetWithTtl(cmd.Key, cmd.Value, cmd.TTL)
-		//} else if dc.Replicas(cmd.Key) {
-		//	dc.storage.Set(cmd.Key, cmd.Value, cmd.TTL)
-		//}
 		if dc.Replicas(cmd.Key) {
-			dc.storage.Set(cmd.Key, cmd.Value, cmd.TTL)
+			if err := dc.storage.Set(cmd.Key, cmd.Value, cmd.TTL); err == nil && dc.Primary(cmd.Key) {
+				// only issue set from primary
+				replicas, _ := dc.storage.Replicas(cmd.Key)
+				lop.ForEach(replicas[1:], func(n *memberlist.Node, _ int) {
+					dc.members.SendBestEffort(n, bytes)
+				})
+			}
 		}
+
 	case del:
-		//if dc.Primary(cmd.Key) {
-		//	dc.Del(cmd.Key)
-		//} else if dc.Replicas(cmd.Key) {
-		//	dc.storage.Del(cmd.Key)
-		//}
-		dc.storage.Del(cmd.Key)
+		if _, err := dc.storage.Del(cmd.Key); err == nil && dc.Primary(cmd.Key) {
+			replicas, _ := dc.storage.Replicas(cmd.Key)
+			lop.ForEach(replicas[1:], func(n *memberlist.Node, _ int) {
+				dc.members.SendBestEffort(n, bytes)
+			})
+		}
 	case get:
-		v, err := dc.storage.Get(cmd.Key)
+		v, ttl, err := dc.storage.Get(cmd.Key)
 		if err != nil {
 			return
 		}
 		caller, err := dc.Node(cmd.Caller)
 		if err != nil {
-			dc.logger.Printf("can not find the key %s \n", err.Error())
-			return
-		}
-		ttl, err := dc.Ttl(cmd.Key)
-		if err != nil {
-			dc.logger.Printf("%s \n", err.Error())
+			dc.Logger().Printf("can not find the key %s \n", err.Error())
 			return
 		}
 		cmd = Command{
@@ -118,13 +118,13 @@ func (dc *cluster) NotifyMsg(bytes []byte) {
 			Seq:    cmd.Seq,
 			TTL:    ttl,
 		}
-		data, _ := json.Marshal(cmd)
+		data, _ := msgpack.Marshal(cmd)
 		dc.members.SendReliable(caller, data)
 	case search:
 		resp := dc.storage.SearchIndex(cmd.Index, cmd.Value)
 		data := []byte("")
 		if len(resp) > 0 {
-			data, _ = json.Marshal(resp)
+			data, _ = msgpack.Marshal(resp)
 		}
 		command := Command{
 			Action: res,
@@ -133,12 +133,15 @@ func (dc *cluster) NotifyMsg(bytes []byte) {
 			Seq:    cmd.Seq,
 			Index:  cmd.Index,
 		}
-		data, _ = json.Marshal(command)
+		data, _ = msgpack.Marshal(command)
 		caller, _ := dc.Node(cmd.Caller)
 		dc.members.SendReliable(caller, data)
 	case res:
 		// keep the response 5 time.Millisecond
-		dc.storage.SetRemote(cmd.Seq, cmd.Key, cmd.Value, 5*time.Millisecond)
+		//dc.storage.SetRemote(cmd.Seq, cmd.Key, cmd.Value, 5*time.Millisecond)
+		c, _ := chanMap.Load(cmd.Seq)
+		resC, _ := c.(chan Command)
+		resC <- Command{Value: cmd.Value, TTL: cmd.TTL}
 		// no index means it's a remote get request
 		// in case current dc is a replica of the key
 		if len(cmd.Index) < 1 && dc.Replicas(cmd.Key) {
@@ -146,7 +149,7 @@ func (dc *cluster) NotifyMsg(bytes []byte) {
 		}
 	case createIndex:
 		var idx internal.IdxMeta
-		err := json.Unmarshal([]byte(cmd.Value), &idx)
+		err := msgpack.Unmarshal([]byte(cmd.Value), &idx)
 		if err == nil {
 			dc.createJsonIndex(idx)
 		} else {
@@ -177,7 +180,7 @@ func (dc *cluster) LocalState(join bool) []byte {
 		fmt.Printf("**LocalState %s\n", dc.members.LocalNode().Name)
 	}
 	indexes, _ := dc.storage.Indexes()
-	data, _ := json.Marshal(indexes)
+	data, _ := msgpack.Marshal(indexes)
 	return data
 }
 
@@ -185,7 +188,12 @@ func (dc *cluster) MergeRemoteState(buf []byte, join bool) {
 	if dc.members != nil {
 		fmt.Printf("**MergeRemoteState %s\n", dc.members.LocalNode().Name)
 	}
-	dc.storage.MergeRemoteState(buf, join)
+	var indexes []internal.IdxMeta
+	if err := msgpack.Unmarshal(buf, &indexes); err != nil {
+		dc.Logger().Printf("failed to unmarshal index data %s \n", err.Error())
+		return
+	}
+	dc.storage.MergeRemoteState(indexes, join)
 }
 
 type broadcast struct {
@@ -207,8 +215,25 @@ func (bc *broadcast) Finished() {
 	}
 }
 
+func (dc *cluster) LocalNode() string {
+	return dc.members.LocalNode().Name
+}
+
+func (dc *cluster) Replicas(key string) bool {
+	nodes, _ := dc.storage.Replicas(key)
+	_, ok := lo.Find(nodes, func(n *memberlist.Node) bool {
+		return n.Name == dc.LocalNode()
+	})
+	return ok
+}
+
+func (dc *cluster) Primary(key string) bool {
+	n, _ := dc.storage.Primary(key)
+	return n.Name == dc.LocalNode()
+}
+
 func (dc *cluster) Set(k, v string) error {
-	return dc.SetWithTtl(k, v, 0*time.Second)
+	return dc.SetWithTtl(k, v, -1*time.Second)
 }
 
 // SetWithTtl always set primary cluster first and then write to the replicas directly.
@@ -220,62 +245,80 @@ func (dc *cluster) SetWithTtl(k, v string, ttl time.Duration) error {
 		return err
 	}
 	cmd := Command{Action: set, Key: k, Value: v, TTL: ttl}
-	data, err := json.Marshal(cmd)
+	data, err := msgpack.Marshal(cmd)
 	if err != nil {
 		return err
 	}
+	replicas, _ := dc.storage.Replicas(k)
 	// make sure write to primary first
 	if dc.Primary(k) {
-		err = dc.storage.Set(k, v, ttl)
-		if err != nil {
-			return err
+		if err = dc.storage.Set(k, v, ttl); err == nil {
+			lop.ForEach(replicas[1:], func(node *memberlist.Node, _ int) {
+				lo.AttemptWithDelay(3, dc.options.Timeout, func(i int, t time.Duration) error {
+					err = dc.members.SendBestEffort(node, data)
+					if err != nil && i+1 < 3 {
+						dc.Logger().Printf("failed to send data to node %s, retry: %d \n", node.Name, i)
+					}
+					return err
+				})
+			})
 		}
+	} else {
+		err = dc.members.SendBestEffort(replicas[0], data)
 	}
-	replicas, _ := dc.storage.Replicas(k)
-	lop.ForEach(replicas, func(node *memberlist.Node, _ int) {
-		if node.Name != dc.members.LocalNode().Name {
-			dc.members.SendBestEffort(node, data)
-		}
-	})
-	return nil
+	return err
 }
 
-func (dc *cluster) Replicas(key string) bool {
-	nodes, _ := dc.storage.Replicas(key)
-	_, ok := lo.Find(nodes, func(n *memberlist.Node) bool {
-		return n.Name == dc.members.LocalNode().Name
-	})
-	return ok
-}
-
-func (dc *cluster) Primary(key string) bool {
-	node, _ := dc.storage.Primary(key)
-	return node.Name == dc.members.LocalNode().Name
-}
-
-func (dc *cluster) Get(k string) (string, error) {
-	v, err := dc.storage.Get(k)
+func (dc *cluster) Get(k string) (string, time.Duration, error) {
+	v, ttl, err := dc.storage.Get(k)
 	if err == nil {
-		return v, nil
+		return v, ttl, nil
 	} else {
 		cmd := Command{Action: get, Key: k, Seq: rand.Uint32(), Caller: dc.members.LocalNode().Name}
-		data, _ := json.Marshal(cmd)
+		data, _ := msgpack.Marshal(cmd)
 		primary, _ := dc.storage.Primary(k)
 		// redirect to the primary node
+		chanMap.Store(cmd.Seq, make(chan Command))
 		go func() {
 			dc.members.SendBestEffort(primary, data)
 		}()
-		return func(c Command) (string, error) {
-			tries, times, _ := lo.AttemptWithDelay(30, 100*time.Microsecond, func(_ int, d time.Duration) error {
-				v, err = dc.storage.GetRemote(c.Seq, c.Key)
-				return err
-			})
-			if err == nil {
-				dc.logger.Printf("redirect %d, times %d", tries, times/time.Microsecond)
+		return func(c Command) (string, time.Duration, error) {
+			gt, _ := chanMap.Load(c.Seq)
+			ch, _ := gt.(chan Command)
+			r, _, t, ok := lo.BufferWithTimeout(ch, 3, dc.Timeout())
+			if ok {
+				dc.Logger().Printf("error: redirect times out %d \n ", t/time.Microsecond)
+			} else {
+				dc.Logger().Printf("redirect elapse %d \n microseconds", t/time.Microsecond)
 			}
-			return v, err
+			chanMap.Delete(c.Seq)
+			close(ch)
+			if len(r) > 0 {
+				return r[0].Value, r[0].TTL, nil
+			} else {
+				return "", -1, err
+			}
 		}(cmd)
 	}
+}
+
+func (dc *cluster) Del(k string) (err error) {
+	cmd := Command{Action: del, Key: k}
+	data, _ := msgpack.Marshal(cmd)
+	replicas, _ := dc.storage.Replicas(k)
+	if dc.Primary(k) {
+		if _, err = dc.storage.Del(k); err == nil {
+			lop.ForEach(replicas[1:], func(node *memberlist.Node, _ int) {
+				dc.members.SendBestEffort(node, data)
+				lo.AttemptWithDelay(3, dc.Timeout(), func(tries int, time time.Duration) error {
+					return dc.members.SendBestEffort(node, data)
+				})
+			})
+		}
+	} else {
+		err = dc.members.SendBestEffort(replicas[0], data)
+	}
+	return
 }
 
 func (dc *cluster) Search(index, criteria string) (map[string]string, error) {
@@ -286,7 +329,7 @@ func (dc *cluster) Search(index, criteria string) (map[string]string, error) {
 		Value:  criteria,
 		Caller: dc.members.LocalNode().Name,
 		Seq:    rand.Uint32()}
-	data, _ := json.Marshal(&cmd)
+	data, _ := msgpack.Marshal(&cmd)
 	lop.ForEach(dc.members.Members(), func(r *memberlist.Node, _ int) {
 		if r.Name != dc.members.LocalNode().Name {
 			dc.members.SendReliable(r, data)
@@ -304,7 +347,7 @@ func (dc *cluster) Search(index, criteria string) (map[string]string, error) {
 			}
 			for _, pks := range packedrs {
 				var rs []internal.Response
-				json.Unmarshal([]byte(pks.Value), &rs)
+				msgpack.Unmarshal([]byte(pks.Value), &rs)
 				node, _ := lo.Last(strings.Split(pks.Key, ":"))
 				for _, r := range rs {
 					p, _ := dc.storage.Primary(r.Key)
@@ -356,19 +399,6 @@ func (dc *cluster) Search(index, criteria string) (map[string]string, error) {
 	}(cmd)
 }
 
-func (dc *cluster) Del(k string) {
-	cmd := Command{Action: del, Key: k}
-	data, _ := json.Marshal(cmd)
-	replicas, _ := dc.storage.Replicas(k)
-	lop.ForEach(replicas, func(node *memberlist.Node, _ int) {
-		if node.Name != dc.members.LocalNode().Name {
-			dc.members.SendReliable(node, data)
-		} else {
-			dc.storage.Del(k)
-		}
-	})
-}
-
 func (dc *cluster) createJsonIndex(index internal.IdxMeta) error {
 
 	indexes, _ := dc.storage.Indexes()
@@ -381,18 +411,18 @@ func (dc *cluster) createJsonIndex(index internal.IdxMeta) error {
 	if err != nil {
 		return err
 	}
-	data, _ := json.Marshal(index)
+	data, _ := msgpack.Marshal(index)
 	c := Command{
 		Action: createIndex,
 		Value:  string(data),
 	}
-	data, _ = json.Marshal(c)
+	data, _ = msgpack.Marshal(c)
 	dc.broadcasts.QueueBroadcast(&broadcast{
 		msg:    data,
 		notify: nil,
 	})
 	if err != nil {
-		dc.logger.Printf("failed to create index %s \n", err.Error())
+		dc.Logger().Printf("failed to create index %s \n", err.Error())
 	}
 	return err
 
@@ -418,7 +448,7 @@ func (dc *cluster) DropIndex(name string) error {
 		Action: dropIndex,
 		Value:  name,
 	}
-	msg, _ := json.Marshal(c)
+	msg, _ := msgpack.Marshal(c)
 	dc.broadcasts.QueueBroadcast(&broadcast{
 		msg:    msg,
 		notify: nil,
