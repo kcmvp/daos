@@ -38,6 +38,7 @@ type Command struct {
 	Seq    uint32        `json:"s,omitempty"`
 	Caller string        `json:"c,omitempty"`
 	Index  string        `json:"i,omitempty"`
+	Error  string        `json:"e,omitempty"`
 }
 
 type cluster struct {
@@ -89,36 +90,36 @@ func (dc *cluster) NotifyMsg(bytes []byte) {
 				// only issue set from primary
 				replicas, _ := dc.storage.Replicas(cmd.Key)
 				lop.ForEach(replicas[1:], func(n *memberlist.Node, _ int) {
-					dc.members.SendBestEffort(n, bytes)
+					lo.AttemptWithDelay(3, dc.Timeout(), func(try int, time time.Duration) error {
+						return dc.members.SendBestEffort(n, bytes)
+					})
 				})
 			}
 		}
 
 	case del:
-		if _, err := dc.storage.Del(cmd.Key); err == nil && dc.Primary(cmd.Key) {
-			replicas, _ := dc.storage.Replicas(cmd.Key)
-			lop.ForEach(replicas[1:], func(n *memberlist.Node, _ int) {
-				dc.members.SendBestEffort(n, bytes)
-			})
+		if _, err := dc.storage.Del(cmd.Key); err != nil {
+			dc.Logger().Printf("failed to delete the key %s: %s \n", cmd.Key, err.Error())
 		}
 	case get:
 		v, ttl, err := dc.storage.Get(cmd.Key)
-		if err != nil {
-			return
-		}
-		caller, err := dc.Node(cmd.Caller)
-		if err != nil {
-			dc.Logger().Printf("can not find the key %s \n", err.Error())
-			return
-		}
-		cmd = Command{
+
+		getRes := Command{
 			Action: res,
 			Key:    cmd.Key,
 			Value:  v,
 			Seq:    cmd.Seq,
 			TTL:    ttl,
 		}
-		data, _ := msgpack.Marshal(cmd)
+		if err != nil {
+			getRes.Error = err.Error()
+		}
+		caller, err := dc.Node(cmd.Caller)
+		if err != nil {
+			dc.Logger().Printf("can not find the node %s: %s \n", cmd.Caller, err.Error())
+			return
+		}
+		data, _ := msgpack.Marshal(getRes)
 		dc.members.SendReliable(caller, data)
 	case search:
 		resp := dc.storage.SearchIndex(cmd.Index, cmd.Value)
@@ -141,10 +142,11 @@ func (dc *cluster) NotifyMsg(bytes []byte) {
 		//dc.storage.SetRemote(cmd.Seq, cmd.Key, cmd.Value, 5*time.Millisecond)
 		c, _ := chanMap.Load(cmd.Seq)
 		resC, _ := c.(chan Command)
-		resC <- Command{Value: cmd.Value, TTL: cmd.TTL}
+		resC <- Command{Value: cmd.Value, TTL: cmd.TTL, Error: cmd.Error}
+		close(resC)
 		// no index means it's a remote get request
 		// in case current dc is a replica of the key
-		if len(cmd.Index) < 1 && dc.Replicas(cmd.Key) {
+		if len(cmd.Index) < 1 && dc.Replicas(cmd.Key) && cmd.Error == "" {
 			dc.storage.Set(cmd.Key, cmd.Value, cmd.TTL)
 		}
 	case createIndex:
@@ -271,8 +273,9 @@ func (dc *cluster) SetWithTtl(k, v string, ttl time.Duration) error {
 
 func (dc *cluster) Get(k string) (string, time.Duration, error) {
 	v, ttl, err := dc.storage.Get(k)
-	if err == nil {
-		return v, ttl, nil
+	// return the value directly when current node is a replica
+	if dc.Replicas(k) {
+		return v, ttl, err
 	} else {
 		cmd := Command{Action: get, Key: k, Seq: rand.Uint32(), Caller: dc.members.LocalNode().Name}
 		data, _ := msgpack.Marshal(cmd)
@@ -286,17 +289,21 @@ func (dc *cluster) Get(k string) (string, time.Duration, error) {
 			gt, _ := chanMap.Load(c.Seq)
 			ch, _ := gt.(chan Command)
 			r, _, t, ok := lo.BufferWithTimeout(ch, 3, dc.Timeout())
-			if ok {
-				dc.Logger().Printf("error: redirect times out %d \n ", t/time.Microsecond)
-			} else {
-				dc.Logger().Printf("redirect elapse %d \n microseconds", t/time.Microsecond)
-			}
 			chanMap.Delete(c.Seq)
-			close(ch)
-			if len(r) > 0 {
-				return r[0].Value, r[0].TTL, nil
+			if ok {
+				dc.Logger().Printf("error: redirect times out %d microseconds\n ", t/time.Microsecond)
+				close(ch)
 			} else {
-				return "", -1, err
+				dc.Logger().Printf("redirect elapse %d microseconds", t/time.Microsecond)
+			}
+			if len(r) > 0 {
+				var e error
+				if len(r[0].Error) > 0 {
+					e = fmt.Errorf(r[0].Error)
+				}
+				return r[0].Value, r[0].TTL, e
+			} else {
+				return "", -1, fmt.Errorf("not found")
 			}
 		}(cmd)
 	}
@@ -306,18 +313,16 @@ func (dc *cluster) Del(k string) (err error) {
 	cmd := Command{Action: del, Key: k}
 	data, _ := msgpack.Marshal(cmd)
 	replicas, _ := dc.storage.Replicas(k)
-	if dc.Primary(k) {
-		if _, err = dc.storage.Del(k); err == nil {
-			lop.ForEach(replicas[1:], func(node *memberlist.Node, _ int) {
-				dc.members.SendBestEffort(node, data)
-				lo.AttemptWithDelay(3, dc.Timeout(), func(tries int, time time.Duration) error {
-					return dc.members.SendBestEffort(node, data)
-				})
-			})
-		}
-	} else {
-		err = dc.members.SendBestEffort(replicas[0], data)
-	}
+	lop.ForEach(replicas, func(node *memberlist.Node, _ int) {
+		_, _, err = lo.AttemptWithDelay(3, dc.Timeout(), func(tries int, time time.Duration) error {
+			if node.Name == dc.LocalNode() {
+				_, err = dc.storage.Del(k)
+			} else {
+				err = dc.members.SendBestEffort(node, data)
+			}
+			return err
+		})
+	})
 	return
 }
 

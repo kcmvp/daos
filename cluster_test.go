@@ -166,15 +166,29 @@ func (suite *DBTestSuite) TestSetAndDel() {
 		fmt.Sprintf("k4%s", strconv.FormatUint(rand.Uint64(), 10)),
 	}
 	lo.ForEach(suite.nodes, func(d DB, idx int) {
-		d.(*cluster).Set(keys[idx], strconv.FormatUint(rand.Uint64(), 10))
+		if idx%2 == 0 {
+			d.(*cluster).SetWithTtl(keys[idx], strconv.FormatUint(rand.Uint64(), 10), time.Minute)
+		} else {
+			d.(*cluster).Set(keys[idx], strconv.FormatUint(rand.Uint64(), 10))
+		}
 	})
+	time.Sleep(500 * time.Microsecond)
 	lo.ForEach(suite.nodes, func(d DB, idx int) {
-		v, _, err := d.(*cluster).Get(keys[idx])
+		v, ttl, err := d.(*cluster).Get(keys[idx])
 		require.NoError(suite.T(), err)
 		require.NotEmpty(suite.T(), v)
+		if idx%2 == 0 {
+			require.True(suite.T(), ttl > 0)
+		} else {
+			require.True(suite.T(), ttl < 0)
+		}
 		err = d.(*cluster).Del(keys[idx])
 		require.NoError(suite.T(), err)
+		//time.Sleep(200 * time.Microsecond)
 		v, _, err = d.(*cluster).Get(keys[idx])
+		if err == nil {
+			fmt.Printf("vv: %s \n", v)
+		}
 		require.Error(suite.T(), err)
 	})
 }

@@ -50,7 +50,6 @@ type DB interface {
 	Set(k, v string) error
 	SetWithTtl(k, v string, ttl time.Duration) error
 	Get(k string) (string, time.Duration, error)
-	//Ttl(k string) (time.Duration, error)
 	Del(k string) error
 	CreateJsonIndex(index Index) error
 	DropIndex(name string) error
