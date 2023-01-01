@@ -1,19 +1,17 @@
 package internal
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
 	"github.com/hashicorp/memberlist"
-	jsoniter "github.com/json-iterator/go"
 	"github.com/samber/lo"
 	"github.com/tidwall/buntdb"
 	"log"
 	"strings"
 	"time"
 )
-
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 const defaultPartitionCount = 1001
 const indexIndexName = "_meta_"
@@ -59,7 +57,7 @@ func (s *Storage) Set(k, v string, ttl time.Duration) error {
 	var err error
 	s.db.Update(func(tx *buntdb.Tx) error {
 		if ttl > 0 {
-			_, _, err = tx.Set(k, v, &buntdb.SetOptions{true, ttl})
+			_, _, err = tx.Set(k, v, &buntdb.SetOptions{Expires: true, TTL: ttl})
 		} else {
 			_, _, err = tx.Set(k, v, nil)
 		}
@@ -73,16 +71,24 @@ func (s *Storage) SetRemote(seq uint32, k, v string, ttl time.Duration) error {
 	return s.Set(key, v, ttl)
 }
 
-func (s *Storage) Get(k string) (v string, err error) {
+func (s *Storage) Get(k string) (v string, ttl time.Duration, err error) {
 	s.db.View(func(tx *buntdb.Tx) error {
 		v, err = tx.Get(k, false)
+		if err != nil {
+			return err
+		}
+		ttl, err = tx.TTL(k)
 		return err
 	})
-	return v, err
+	if err != nil {
+		v = ""
+	}
+	return
 }
 
 func (s *Storage) GetRemote(seq uint32, k string) (v string, err error) {
-	return s.Get(remoteKey(seq, k))
+	v, _, err = s.Get(remoteKey(seq, k))
+	return
 }
 
 func (s *Storage) Ttl(k string) (time.Duration, error) {
@@ -196,12 +202,10 @@ func (s *Storage) DropIndex(name string) error {
 	return err
 }
 
-func (s *Storage) MergeRemoteState(buf []byte, join bool) {
-	var indexes []IdxMeta
+func (s *Storage) MergeRemoteState(indexes []IdxMeta, join bool) {
 	var existing []IdxMeta
-	json.Unmarshal(buf, &indexes)
 	lo.ForEach(indexes, func(item IdxMeta, _ int) {
-		v, err := s.Get(fmt.Sprintf("%s%s", indexNamePrefix, item.Name))
+		v, _, err := s.Get(fmt.Sprintf("%s%s", indexNamePrefix, item.Name))
 		var idx IdxMeta
 		if err == nil {
 			json.Unmarshal([]byte(v), &idx)

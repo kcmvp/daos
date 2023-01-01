@@ -43,39 +43,44 @@ type Options struct {
 	// Replicas replication factor
 	Replicas int
 	Logger   *log.Logger
+	Timeout  time.Duration
 }
 
 type DB interface {
 	Set(k, v string) error
 	SetWithTtl(k, v string, ttl time.Duration) error
-	Get(k string) (string, error)
-	Ttl(k string) (time.Duration, error)
-	Del(k string)
+	Get(k string) (string, time.Duration, error)
+	//Ttl(k string) (time.Duration, error)
+	Del(k string) error
 	CreateJsonIndex(index Index) error
 	DropIndex(name string) error
 	Search(index string, by string) (map[string]string, error)
 	Shutdown()
 }
 
-func NewDB(opt Options) (DB, error) {
+func NewDB(options Options) (DB, error) {
 	cfg := memberlist.DefaultLocalConfig()
-	if opt.Port > 0 {
-		cfg.BindPort = opt.Port
+	if options.Port > 0 {
+		cfg.BindPort = options.Port
 	} else {
 		cfg.BindPort = DefaultPort
 	}
-	if opt.Logger == nil {
-		opt.Logger = log.New(os.Stderr, "", log.LstdFlags)
+	if options.Logger == nil {
+		options.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
-	cfg.Logger = opt.Logger
+	// default timeout is 4 * ProbeTimeout
+	if options.Timeout == 0 {
+		options.Timeout = cfg.ProbeTimeout * 4
+	}
+	cfg.Logger = options.Logger
 	cfg.Name = fmt.Sprintf("%s-%d", cfg.Name, cfg.BindPort)
-	storage, err := internal.NewStorage(opt.Replicas, cfg.Logger)
+	storage, err := internal.NewStorage(options.Replicas, cfg.Logger)
 	if err != nil {
 		return nil, err
 	}
 	c := &cluster{
 		storage: storage,
-		logger:  cfg.Logger,
+		options: options,
 	}
 	cfg.Events = &event{storage}
 	cfg.Delegate = c
@@ -84,8 +89,8 @@ func NewDB(opt Options) (DB, error) {
 		return nil, err
 	}
 	// add db to db
-	if len(opt.Nodes) > 0 {
-		members.Join(opt.Nodes)
+	if len(options.Nodes) > 0 {
+		members.Join(options.Nodes)
 	}
 	c.broadcasts = &memberlist.TransmitLimitedQueue{
 		NumNodes: func() int {
@@ -94,5 +99,6 @@ func NewDB(opt Options) (DB, error) {
 		RetransmitMult: 3,
 	}
 	c.members = members
+	c.options = options
 	return c, nil
 }
