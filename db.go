@@ -12,7 +12,7 @@ import (
 
 type Index struct {
 	Name     string   `json:"name"`
-	Bucket   string   `json:"key"`
+	Key      string   `json:"key"`
 	JsonPath []string `json:"paths"`
 }
 
@@ -21,7 +21,7 @@ func (idx Index) Validate() error {
 	if err != nil {
 		return err
 	}
-	err = lo.Validate(len(idx.Bucket) > 0, "bucket can not be emtpy")
+	err = lo.Validate(len(idx.Key) > 0, "bucket can not be emtpy")
 	if err != nil {
 		return err
 	}
@@ -53,6 +53,7 @@ type DB interface {
 	Del(k string) error
 	CreateJsonIndex(index Index) error
 	DropIndex(name string) error
+	Indexes() []Index
 	Search(index string, by string) (map[string]string, error)
 	Shutdown()
 }

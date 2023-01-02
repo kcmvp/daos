@@ -1,17 +1,30 @@
 package daos
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
+	"github.com/brianvoe/gofakeit/v6"
 	"github.com/hashicorp/memberlist"
 	"github.com/samber/lo"
+	lop "github.com/samber/lo/parallel"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"log"
 	"math/rand"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+type Book struct {
+	Name      string `faker:"word,unique"`
+	Date      sql.NullTime
+	Author    string `fake:"{randomstring:[aa,ab]}"`
+	Publisher string `fake:"{randomstring:[pa,pb]}"`
+	Price     int
+}
 
 func startNodes(num int) []DB {
 	var dbs []DB
@@ -45,6 +58,17 @@ func (suite *DBTestSuite) TearDownSuite() {
 	lo.ForEach(suite.nodes, func(db DB, _ int) {
 		db.Shutdown()
 	})
+}
+
+func (suite *DBTestSuite) AfterTest(_, method string) {
+	if strings.HasSuffix(method, "Index") {
+		lop.ForEach(suite.nodes, func(db DB, _ int) {
+			lop.ForEach(db.Indexes(), func(idx Index, _ int) {
+				db.DropIndex(idx.Name)
+			})
+			require.Equal(suite.T(), 0, len(db.Indexes()))
+		})
+	}
 }
 
 func TestDbSuit(t *testing.T) {
@@ -192,21 +216,41 @@ func (suite *DBTestSuite) TestSetAndDel() {
 		require.Error(suite.T(), err)
 	})
 }
-func (suite *DBTestSuite) TestCreateIndex() {
+func (suite *DBTestSuite) TestCreateDropIndex() {
 	suite.nodes[0].CreateJsonIndex(Index{
 		Name:     "idx1",
-		Bucket:   "abc*",
+		Key:      "abc*",
 		JsonPath: []string{"abc.def"},
 	})
 	time.Sleep(200 * time.Millisecond)
-	var ver int64
 	for _, node := range suite.nodes {
 		c := node.(*cluster)
 		indexes, _ := c.storage.Indexes()
-		if ver == 0 {
-			ver = indexes[0].Version
-		}
+		ver := indexes[0].Version
 		require.Equal(suite.T(), ver, indexes[0].Version)
 		require.Equal(suite.T(), 1, len(indexes), c.members.LocalNode().Name)
 	}
+}
+
+func (suite *DBTestSuite) TestSearchIndex() {
+	suite.nodes[0].CreateJsonIndex(Index{
+		"booIndex",
+		"b:*",
+		[]string{"author"},
+	})
+	time.Sleep(100 * time.Microsecond)
+	lo.ForEach(suite.nodes, func(db DB, _ int) {
+		fmt.Println(len(db.Indexes()))
+		require.Equal(suite.T(), 1, len(db.Indexes()))
+	})
+	books := lo.Times[Book](20, func(_ int) Book {
+		var b Book
+		gofakeit.Struct(&b)
+		fmt.Println(b)
+		return b
+	})
+	lo.ForEach(books, func(b Book, _ int) {
+		str, _ := json.Marshal(b)
+		suite.nodes[0].(*cluster).Set(fmt.Sprintf("b:%s", b.Name), string(str))
+	})
 }

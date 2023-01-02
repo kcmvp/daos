@@ -1,6 +1,7 @@
 package daos
 
 import (
+	"errors"
 	"fmt"
 	"github.com/hashicorp/memberlist"
 	"github.com/kcmvp/daos/internal"
@@ -20,15 +21,14 @@ const (
 	set action = iota
 	del
 	get
+	getResp
 	search
-	res
+	searchResp
 	createIndex
 	dropIndex
 )
 
 const DefaultPort = 7080
-
-var chanMap sync.Map
 
 type Command struct {
 	Action action        `json:"a,omitempty"`
@@ -41,11 +41,25 @@ type Command struct {
 	Error  string        `json:"e,omitempty"`
 }
 
+type Handler func(dc *cluster, cmd Command)
+
+var handlers = map[action]Handler{
+	set:         setHandler,
+	del:         delHandler,
+	get:         getHandler,
+	getResp:     getRespHandler,
+	search:      setHandler,
+	searchResp:  searchRespHandler,
+	createIndex: createIndexHandler,
+	dropIndex:   dropIndexHandler,
+}
+
 type cluster struct {
 	storage    *internal.Storage
 	members    *memberlist.Memberlist
 	broadcasts *memberlist.TransmitLimitedQueue
 	options    Options
+	chanMap    sync.Map
 }
 
 func (dc *cluster) Logger() *log.Logger {
@@ -59,9 +73,6 @@ func (dc *cluster) Shutdown() {
 }
 
 func (dc *cluster) NodeMeta(limit int) []byte {
-	if dc.members != nil {
-		fmt.Printf("**NodeMeta %s\n", dc.members.LocalNode().Name)
-	}
 	indexes, size := dc.storage.Indexes()
 	idxes := lo.DropRightWhile(indexes, func(item internal.IdxMeta) bool {
 		if size > limit {
@@ -77,91 +88,16 @@ func (dc *cluster) NodeMeta(limit int) []byte {
 }
 
 func (dc *cluster) NotifyMsg(bytes []byte) {
-	fmt.Printf("**NotifyMsg %s\n\n", dc.members.LocalNode().Name)
 	cmd := Command{}
 	if err := msgpack.Unmarshal(bytes, &cmd); err != nil {
 		dc.options.Logger.Printf("incorrect user msg %s \n", err.Error())
 		return
 	}
-	switch cmd.Action {
-	case set:
-		if dc.Replicas(cmd.Key) {
-			if err := dc.storage.Set(cmd.Key, cmd.Value, cmd.TTL); err == nil && dc.Primary(cmd.Key) {
-				// only issue set from primary
-				replicas, _ := dc.storage.Replicas(cmd.Key)
-				lop.ForEach(replicas[1:], func(n *memberlist.Node, _ int) {
-					lo.AttemptWithDelay(3, dc.Timeout(), func(try int, time time.Duration) error {
-						return dc.members.SendBestEffort(n, bytes)
-					})
-				})
-			}
-		}
-
-	case del:
-		if _, err := dc.storage.Del(cmd.Key); err != nil {
-			dc.Logger().Printf("failed to delete the key %s: %s \n", cmd.Key, err.Error())
-		}
-	case get:
-		v, ttl, err := dc.storage.Get(cmd.Key)
-
-		getRes := Command{
-			Action: res,
-			Key:    cmd.Key,
-			Value:  v,
-			Seq:    cmd.Seq,
-			TTL:    ttl,
-		}
-		if err != nil {
-			getRes.Error = err.Error()
-		}
-		caller, err := dc.Node(cmd.Caller)
-		if err != nil {
-			dc.Logger().Printf("can not find the node %s: %s \n", cmd.Caller, err.Error())
-			return
-		}
-		data, _ := msgpack.Marshal(getRes)
-		dc.members.SendReliable(caller, data)
-	case search:
-		resp := dc.storage.SearchIndex(cmd.Index, cmd.Value)
-		data := []byte("")
-		if len(resp) > 0 {
-			data, _ = msgpack.Marshal(resp)
-		}
-		command := Command{
-			Action: res,
-			Key:    dc.members.LocalNode().Name,
-			Value:  string(data),
-			Seq:    cmd.Seq,
-			Index:  cmd.Index,
-		}
-		data, _ = msgpack.Marshal(command)
-		caller, _ := dc.Node(cmd.Caller)
-		dc.members.SendReliable(caller, data)
-	case res:
-		// keep the response 5 time.Millisecond
-		//dc.storage.SetRemote(cmd.Seq, cmd.Key, cmd.Value, 5*time.Millisecond)
-		c, _ := chanMap.Load(cmd.Seq)
-		resC, _ := c.(chan Command)
-		resC <- Command{Value: cmd.Value, TTL: cmd.TTL, Error: cmd.Error}
-		close(resC)
-		// no index means it's a remote get request
-		// in case current dc is a replica of the key
-		if len(cmd.Index) < 1 && dc.Replicas(cmd.Key) && cmd.Error == "" {
-			dc.storage.Set(cmd.Key, cmd.Value, cmd.TTL)
-		}
-	case createIndex:
-		var idx internal.IdxMeta
-		err := msgpack.Unmarshal([]byte(cmd.Value), &idx)
-		if err == nil {
-			dc.createJsonIndex(idx)
-		} else {
-			fmt.Println(err.Error())
-		}
-	case dropIndex:
-		dc.DropIndex(cmd.Value)
-	}
+	handler, _ := handlers[cmd.Action]
+	handler(dc, cmd)
 }
-func (dc *cluster) Node(name string) (*memberlist.Node, error) {
+
+func (dc *cluster) NodeByName(name string) (*memberlist.Node, error) {
 	node, ok := lo.Find(dc.members.Members(), func(node *memberlist.Node) bool {
 		return node.Name == name
 	})
@@ -173,23 +109,17 @@ func (dc *cluster) Node(name string) (*memberlist.Node, error) {
 }
 
 func (dc *cluster) GetBroadcasts(overhead, limit int) [][]byte {
-	//fmt.Printf("**GetBroadcasts %s\dc", dc.members.LocalNode().Name)
 	return dc.broadcasts.GetBroadcasts(overhead, limit)
 }
 
 func (dc *cluster) LocalState(join bool) []byte {
-	if dc.members != nil {
-		fmt.Printf("**LocalState %s\n", dc.members.LocalNode().Name)
-	}
+
 	indexes, _ := dc.storage.Indexes()
 	data, _ := msgpack.Marshal(indexes)
 	return data
 }
 
 func (dc *cluster) MergeRemoteState(buf []byte, join bool) {
-	if dc.members != nil {
-		fmt.Printf("**MergeRemoteState %s\n", dc.members.LocalNode().Name)
-	}
 	var indexes []internal.IdxMeta
 	if err := msgpack.Unmarshal(buf, &indexes); err != nil {
 		dc.Logger().Printf("failed to unmarshal index data %s \n", err.Error())
@@ -271,25 +201,38 @@ func (dc *cluster) SetWithTtl(k, v string, ttl time.Duration) error {
 	return err
 }
 
+func (dc *cluster) newChan(chanId uint32, buffer ...int) {
+	size := 0
+	if len(buffer) > 0 && buffer[0] > 0 {
+		size = buffer[0]
+	}
+	dc.chanMap.Store(chanId, make(chan Command, size))
+}
+func (dc *cluster) getChan(chanId uint32) (chan Command, bool) {
+	ch, ok := dc.chanMap.Load(chanId)
+	return lo.Ternary(ok, ch.(chan Command), nil), ok
+}
+func (dc *cluster) delChan(id uint32) {
+	dc.chanMap.Delete(id)
+}
+
 func (dc *cluster) Get(k string) (string, time.Duration, error) {
 	v, ttl, err := dc.storage.Get(k)
 	// return the value directly when current node is a replica
 	if dc.Replicas(k) {
 		return v, ttl, err
 	} else {
-		cmd := Command{Action: get, Key: k, Seq: rand.Uint32(), Caller: dc.members.LocalNode().Name}
+		cmd := Command{Action: get, Key: k, Seq: rand.Uint32(), Caller: dc.LocalNode()}
 		data, _ := msgpack.Marshal(cmd)
 		primary, _ := dc.storage.Primary(k)
-		// redirect to the primary node
-		chanMap.Store(cmd.Seq, make(chan Command))
+		dc.newChan(cmd.Seq, 1)
 		go func() {
 			dc.members.SendBestEffort(primary, data)
 		}()
 		return func(c Command) (string, time.Duration, error) {
-			gt, _ := chanMap.Load(c.Seq)
-			ch, _ := gt.(chan Command)
-			r, _, t, ok := lo.BufferWithTimeout(ch, 3, dc.Timeout())
-			chanMap.Delete(c.Seq)
+			ch, _ := dc.getChan(c.Seq)
+			r, _, t, ok := lo.BufferWithTimeout(ch, 2, dc.Timeout())
+			dc.delChan(c.Seq)
 			if ok {
 				dc.Logger().Printf("error: redirect times out %d microseconds\n ", t/time.Microsecond)
 				close(ch)
@@ -327,110 +270,99 @@ func (dc *cluster) Del(k string) (err error) {
 }
 
 func (dc *cluster) Search(index, criteria string) (map[string]string, error) {
-	// send ipc_search request to the dc
+	// send search request to the dc
 	cmd := Command{
 		Action: search,
 		Index:  index,
 		Value:  criteria,
-		Caller: dc.members.LocalNode().Name,
+		Caller: dc.LocalNode(),
 		Seq:    rand.Uint32()}
 	data, _ := msgpack.Marshal(&cmd)
+	dc.newChan(cmd.Seq, dc.members.NumMembers())
 	lop.ForEach(dc.members.Members(), func(r *memberlist.Node, _ int) {
-		if r.Name != dc.members.LocalNode().Name {
-			dc.members.SendReliable(r, data)
+		if r.Name != dc.LocalNode() {
+			dc.members.SendBestEffort(r, data)
 		}
 	})
 	// get the result
 	return func(c Command) (map[string]string, error) {
-		local := dc.storage.SearchIndex(c.Index, c.Value)
-		var primaries []internal.Response
-		var replicas []internal.Response
-		_, _, err := lo.AttemptWithDelay(6, 300*time.Microsecond, func(n int, d time.Duration) error {
-			packedrs := dc.storage.ScanIndexRemote(c.Seq)
-			if len(packedrs)+1 != len(dc.members.Members()) {
-				return fmt.Errorf("try %d", n)
-			}
-			for _, pks := range packedrs {
-				var rs []internal.Response
-				msgpack.Unmarshal([]byte(pks.Value), &rs)
-				node, _ := lo.Last(strings.Split(pks.Key, ":"))
-				for _, r := range rs {
-					p, _ := dc.storage.Primary(r.Key)
-					if node == p.Name {
-						primaries = append(primaries, r)
-					} else {
-						replicas = append(replicas, r)
-					}
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return map[string]string{}, err
+		ch, _ := dc.getChan(c.Seq)
+		remote, l, _, ok := lo.BufferWithTimeout(ch, dc.members.NumMembers()-1, dc.Timeout())
+		dc.delChan(c.Seq)
+		if ok {
+			close(ch)
 		}
-		// update the missing key-value
-		go func() {
-			remote := append(primaries, replicas...)
-			var processed []string
-			lo.ForEach(remote, func(r internal.Response, _ int) {
-				if dc.Replicas(r.Key) && !lo.ContainsBy(local, func(l internal.Response) bool {
-					return r.Key == l.Key
-				}) && !lo.ContainsBy(processed, func(p string) bool {
-					return r.Key == p
-				}) {
-					processed = append(processed, r.Key)
-				}
-			})
-		}()
+		if l != dc.members.NumMembers()-1 {
+			return map[string]string{}, errors.New("can't get response from some nodes")
+		}
+		// query local
+		local := dc.storage.SearchIndex(c.Index, c.Value)
+		t3s := lo.Map(local, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
+			return lo.T3(dc.LocalNode(), r.Key, r.Value)
+		})
+		lop.ForEach(remote, func(item Command, _ int) {
+			if len(item.Value) > 0 {
+				var rows []internal.Row
+				msgpack.Unmarshal([]byte(item.Value), &rows)
+				a := lop.Map(rows, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
+					return lo.T3(item.Key, r.Key, r.Value)
+				})
+				t3s = append(t3s, a...)
+			}
+		})
 
-		// 2: always get the value from primary dc
-		rt := lo.FilterMap(local, func(l internal.Response, _ int) (internal.Response, bool) {
-			return l, !lo.ContainsBy(primaries, func(i internal.Response) bool {
-				return true
-			})
+		groups := lop.GroupBy(t3s, func(t3 lo.Tuple3[string, string, string]) int {
+			node, _ := dc.storage.Primary(t3.B)
+			if node.Name == t3.A {
+				return 1
+			} else {
+				return 0
+			}
 		})
-		primaries = append(primaries, rt...)
-		rt = lo.FilterMap(replicas, func(l internal.Response, _ int) (internal.Response, bool) {
-			return l, !lo.ContainsBy(primaries, func(i internal.Response) bool {
-				return true
-			})
-		})
-		primaries = append(primaries, rt...)
-		var m map[string]string
-		lo.ForEach(primaries, func(i internal.Response, _ int) {
-			m[i.Key] = i.Value
-		})
-		return m, err
+		if len(groups) != 2 || len(groups[0]) != len(groups[1]) {
+			dc.Logger().Printf("error: data lost in replicas")
+			return map[string]string{}, errors.New("data lost in replicas")
+		}
+		return lo.SliceToMap(groups[1], func(t3 lo.Tuple3[string, string, string]) (string, string) {
+			return t3.B, t3.C
+		}), nil
 	}(cmd)
 }
 
-func (dc *cluster) createJsonIndex(index internal.IdxMeta) error {
-
+func (dc *cluster) hasIndex(index string) bool {
 	indexes, _ := dc.storage.Indexes()
-	if lo.ContainsBy(indexes, func(idx internal.IdxMeta) bool {
-		return idx.Name == index.Name
-	}) {
-		return fmt.Errorf("existing index name %s", index.Name)
-	}
-	err := dc.storage.CreateIndex(index)
-	if err != nil {
-		return err
-	}
+	return lo.ContainsBy(indexes, func(idx internal.IdxMeta) bool {
+		return idx.Name == index
+	})
+}
+func (dc *cluster) createJsonIndex(index internal.IdxMeta) error {
 	data, _ := msgpack.Marshal(index)
 	c := Command{
 		Action: createIndex,
 		Value:  string(data),
 	}
 	data, _ = msgpack.Marshal(c)
-	dc.broadcasts.QueueBroadcast(&broadcast{
-		msg:    data,
-		notify: nil,
+	var failedNodes []string
+	lo.ForEach(dc.members.Members(), func(m *memberlist.Node, _ int) {
+		var err error
+		lo.AttemptWithDelay(3, dc.Timeout(), func(n int, t time.Duration) error {
+			if m.Name == dc.LocalNode() {
+				if !dc.hasIndex(index.Name) {
+					err = dc.storage.CreateIndex(index)
+				} else {
+					dc.Logger().Printf("index %s exists, broadcast to other nodes\n", index.Name)
+				}
+			} else {
+				err = dc.members.SendBestEffort(m, data)
+			}
+			return err
+		})
+		if err != nil {
+			dc.Logger().Printf("failed to create index %s on node %s \n", index.Name, m.Name)
+			failedNodes = append(failedNodes, m.Name)
+		}
 	})
-	if err != nil {
-		dc.Logger().Printf("failed to create index %s \n", err.Error())
-	}
-	return err
-
+	return lo.Ternary[error](len(failedNodes) > 0, fmt.Errorf("failed to create index %s : %+v", index.Name, failedNodes), nil)
 }
 func (dc *cluster) CreateJsonIndex(index Index) error {
 	if err := index.Validate(); err != nil {
@@ -438,27 +370,51 @@ func (dc *cluster) CreateJsonIndex(index Index) error {
 	}
 	return dc.createJsonIndex(internal.IdxMeta{
 		Name:     index.Name,
-		Bucket:   index.Bucket,
+		Key:      index.Key,
 		JsonPath: index.JsonPath,
 		Version:  time.Now().UnixMilli(),
 	})
 }
 
 func (dc *cluster) DropIndex(name string) error {
-	err := dc.storage.DropIndex(name)
-	if err != nil {
-		return err
-	}
 	c := Command{
 		Action: dropIndex,
 		Value:  name,
 	}
 	msg, _ := msgpack.Marshal(c)
-	dc.broadcasts.QueueBroadcast(&broadcast{
-		msg:    msg,
-		notify: nil,
+	var errs []error
+	lop.ForEach(dc.members.Members(), func(m *memberlist.Node, _ int) {
+		var err error
+		if m.Name == dc.LocalNode() {
+			if dc.hasIndex(name) {
+				err = dc.storage.DropIndex(name)
+			}
+		} else {
+			_, _, err = lo.AttemptWithDelay(3, dc.Timeout(), func(n int, t time.Duration) error {
+				if err = dc.members.SendBestEffort(m, msg); err != nil {
+					dc.Logger().Printf("drip index %s, retry %d \n", name, n)
+					return err
+				}
+				return nil
+			})
+		}
+		if err != nil {
+			dc.Logger().Printf("error: failed to drop index %s on node %s \n", name, dc.LocalNode())
+			errs = append(errs, err)
+		}
 	})
-	return err
+	if len(errs) == 0 {
+		return nil
+	} else {
+		return fmt.Errorf("failed to drop index %s", name)
+	}
+}
+
+func (dc *cluster) Indexes() []Index {
+	idxes, _ := dc.storage.Indexes()
+	return lo.Map(idxes, func(idx internal.IdxMeta, _ int) Index {
+		return Index{Name: idx.Name, Key: idx.Key, JsonPath: idx.JsonPath}
+	})
 }
 
 var _ DB = (*cluster)(nil)

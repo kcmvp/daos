@@ -15,23 +15,20 @@ import (
 
 const defaultPartitionCount = 1001
 const indexIndexName = "_meta_"
-const indexNamePrefix = "_idx_:"
+const indexKeyPrefix = "_idx_:"
 const indexVersion = "version"
 
-const remoteResIndexName = "_ipc_"
-const remoteResKeyPrefix = "_ipc_:"
-
 func ReversedIndex() []string {
-	return []string{indexIndexName, remoteResIndexName}
+	return []string{indexIndexName}
 }
 
 func ReversedBucket() []string {
-	return []string{indexNamePrefix, remoteResKeyPrefix}
+	return []string{indexKeyPrefix}
 }
 
 type IdxMeta struct {
 	Name     string   `json:"name"`
-	Bucket   string   `json:"key"`
+	Key      string   `json:"key"`
 	JsonPath []string `json:"paths"`
 	Version  int64    `json:"version"`
 }
@@ -43,14 +40,10 @@ type Storage struct {
 	*consistent.Consistent
 }
 
-type Response struct {
+type Row struct {
 	Key   string        `json:"k,omitempty"`
 	Value string        `json:"v,omitempty"`
 	TTL   time.Duration `json:"t,omitempty"`
-}
-
-func remoteKey(seq uint32, key string) string {
-	return fmt.Sprintf("%s%d:%s", remoteResKeyPrefix, seq, key)
 }
 
 func (s *Storage) Set(k, v string, ttl time.Duration) error {
@@ -64,11 +57,6 @@ func (s *Storage) Set(k, v string, ttl time.Duration) error {
 		return err
 	})
 	return err
-}
-
-func (s *Storage) SetRemote(seq uint32, k, v string, ttl time.Duration) error {
-	key := remoteKey(seq, k)
-	return s.Set(key, v, ttl)
 }
 
 func (s *Storage) Get(k string) (v string, ttl time.Duration, err error) {
@@ -86,11 +74,6 @@ func (s *Storage) Get(k string) (v string, ttl time.Duration, err error) {
 	return
 }
 
-func (s *Storage) GetRemote(seq uint32, k string) (v string, err error) {
-	v, _, err = s.Get(remoteKey(seq, k))
-	return
-}
-
 func (s *Storage) Ttl(k string) (time.Duration, error) {
 	var ttl time.Duration
 	var err error
@@ -101,31 +84,31 @@ func (s *Storage) Ttl(k string) (time.Duration, error) {
 	return ttl, err
 }
 
-func (s *Storage) SearchIndex(index, criteria string) []Response {
-	var resp []Response
+func (s *Storage) SearchIndex(index, criteria string) []Row {
+	var rows []Row
 	s.db.View(func(tx *buntdb.Tx) error {
 		tx.AscendEqual(index, criteria, func(key, value string) bool {
 			ttl, _ := tx.TTL(key)
-			r := Response{
+			r := Row{
 				Key:   key,
 				Value: value,
 				TTL:   ttl,
 			}
-			resp = append(resp, r)
+			rows = append(rows, r)
 			return true
 		})
 		return nil
 	})
-	return resp
+	return rows
 }
 
-func (s *Storage) ScanIndex(index, indexPrefix string) []Response {
-	var resp []Response
+func (s *Storage) ScanIndex(index, indexPrefix string) []Row {
+	var resp []Row
 	s.db.View(func(tx *buntdb.Tx) error {
 		tx.Ascend(index, func(key, value string) bool {
 			if strings.HasPrefix(key, indexPrefix) {
 				ttl, _ := tx.TTL(key)
-				r := Response{
+				r := Row{
 					Key:   key,
 					Value: value,
 					TTL:   ttl,
@@ -137,11 +120,6 @@ func (s *Storage) ScanIndex(index, indexPrefix string) []Response {
 		return nil
 	})
 	return resp
-}
-
-func (s *Storage) ScanIndexRemote(seq uint32) []Response {
-	prefix := fmt.Sprintf("%s%d", remoteResKeyPrefix, seq)
-	return s.ScanIndex(remoteResIndexName, prefix)
 }
 
 func (s *Storage) Del(k string) (v string, err error) {
@@ -175,7 +153,7 @@ func (s *Storage) CreateIndex(index IdxMeta) error {
 		jsonIndex := lo.Map[string, func(a, b string) bool](index.JsonPath, func(p string, _ int) func(a, b string) bool {
 			return buntdb.IndexJSON(p)
 		})
-		err = tx.CreateIndex(index.Name, index.Bucket, jsonIndex...)
+		err = tx.CreateIndex(index.Name, index.Key, jsonIndex...)
 		if err != nil {
 			return err
 		}
@@ -183,7 +161,7 @@ func (s *Storage) CreateIndex(index IdxMeta) error {
 		if err != nil {
 			return err
 		}
-		_, _, err = tx.Set(fmt.Sprintf("%s%s", indexNamePrefix, index.Name), string(data), nil)
+		_, _, err = tx.Set(fmt.Sprintf("%s%s", indexKeyPrefix, index.Name), string(data), nil)
 		return err
 	})
 	return err
@@ -196,7 +174,7 @@ func (s *Storage) DropIndex(name string) error {
 		if err != nil {
 			return err
 		}
-		_, err = tx.Delete(fmt.Sprintf("%s%s", indexNamePrefix, name))
+		_, err = tx.Delete(fmt.Sprintf("%s%s", indexKeyPrefix, name))
 		return err
 	})
 	return err
@@ -205,7 +183,7 @@ func (s *Storage) DropIndex(name string) error {
 func (s *Storage) MergeRemoteState(indexes []IdxMeta, join bool) {
 	var existing []IdxMeta
 	lo.ForEach(indexes, func(item IdxMeta, _ int) {
-		v, _, err := s.Get(fmt.Sprintf("%s%s", indexNamePrefix, item.Name))
+		v, _, err := s.Get(fmt.Sprintf("%s%s", indexKeyPrefix, item.Name))
 		var idx IdxMeta
 		if err == nil {
 			json.Unmarshal([]byte(v), &idx)
@@ -233,12 +211,7 @@ func NewStorage(replicas int, logger *log.Logger) (*Storage, error) {
 		return nil, err
 	}
 	err = db.Update(func(tx *buntdb.Tx) error {
-		err = tx.CreateIndex(remoteResIndexName, fmt.Sprintf("%s*", remoteResKeyPrefix), buntdb.IndexString)
-		if err != nil {
-			return err
-		}
-		err = tx.CreateIndex(indexIndexName, fmt.Sprintf("%s*", indexNamePrefix), buntdb.IndexJSON(indexVersion))
-		return err
+		return tx.CreateIndex(indexIndexName, fmt.Sprintf("%s*", indexKeyPrefix), buntdb.IndexJSON(indexVersion))
 	})
 	if err != nil {
 		panic(fmt.Sprintf("failed to init database %s", err.Error()))
