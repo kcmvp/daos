@@ -334,7 +334,7 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 		})
 		if len(replicas) != len(groups[1]) {
 			//@todo need to find out the missing replica and send to node
-			dc.Logger().Printf("warning: data lost in replicas")
+			dc.Logger().Printf("warning: data losts in replicas")
 			//@todo debug info
 			for k, v := range replicas {
 				fmt.Printf("00:%s,%s \n", k, v)
@@ -370,8 +370,6 @@ func (dc *cluster) createJsonIndex(index internal.IdxMeta) error {
 			if m.Name == dc.LocalNode() {
 				if !dc.existingIndex(index.Name) {
 					err = dc.storage.CreateIndex(index)
-				} else {
-					dc.Logger().Printf("index %s exists, broadcast to other nodes\n", index.Name)
 				}
 			} else {
 				err = dc.members.SendBestEffort(m, data)
