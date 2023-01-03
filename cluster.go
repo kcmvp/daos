@@ -29,6 +29,7 @@ const (
 )
 
 const DefaultPort = 7080
+const DefaultPartitions = 1001
 
 type Command struct {
 	Action action        `json:"a,omitempty"`
@@ -62,14 +63,6 @@ type cluster struct {
 	chanMap    sync.Map
 }
 
-func (dc *cluster) Logger() *log.Logger {
-	return dc.options.Logger
-}
-
-func (dc *cluster) Shutdown() {
-	dc.members.Shutdown()
-}
-
 func (dc *cluster) NodeMeta(limit int) []byte {
 	indexes, size := dc.storage.Indexes()
 	idxes := lo.DropRightWhile(indexes, func(item internal.IdxMeta) bool {
@@ -93,23 +86,6 @@ func (dc *cluster) NotifyMsg(bytes []byte) {
 	}
 	handler, _ := handlers[cmd.Action]
 	handler(dc, cmd)
-}
-
-func (dc *cluster) NodeByName(name string) (*memberlist.Node, error) {
-	node, ok := lo.Find(dc.members.Members(), func(node *memberlist.Node) bool {
-		return node.Name == name
-	})
-	if ok {
-		return node, nil
-	} else {
-		return nil, fmt.Errorf("can not find the dc %s", name)
-	}
-}
-
-func (dc *cluster) Nodes() []string {
-	return lo.Map(dc.members.Members(), func(item *memberlist.Node, _ int) string {
-		return item.Name
-	})
 }
 
 func (dc *cluster) GetBroadcasts(overhead, limit int) [][]byte {
@@ -152,8 +128,33 @@ func (bc *broadcast) Finished() {
 	}
 }
 
+func (dc *cluster) Logger() *log.Logger {
+	return dc.options.Logger
+}
+
+func (dc *cluster) Shutdown() {
+	dc.members.Shutdown()
+}
+
 func (dc *cluster) LocalNode() string {
 	return dc.members.LocalNode().Name
+}
+
+func (dc *cluster) Nodes() []string {
+	return lo.Map(dc.members.Members(), func(item *memberlist.Node, _ int) string {
+		return item.Name
+	})
+}
+
+func (dc *cluster) NodeByName(name string) (*memberlist.Node, error) {
+	node, ok := lo.Find(dc.members.Members(), func(node *memberlist.Node) bool {
+		return node.Name == name
+	})
+	if ok {
+		return node, nil
+	} else {
+		return nil, fmt.Errorf("can not find the dc %s", name)
+	}
 }
 
 func (dc *cluster) Replicas(key string) bool {

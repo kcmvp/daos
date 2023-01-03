@@ -52,17 +52,17 @@ func startCluster(num int) []DB {
 	}
 	return dbs
 }
-func startSingle() DB {
-	var db DB
-	var err error
-	random := time.Now().Unix() % 100
-	if db, err = NewDB(Options{
-		Port:     DefaultPort + int(random),
-		Replicas: 2,
-	}); err != nil {
-		log.Fatalf("failed to start the cluster %s", err.Error())
+func startSingle(options ...Options) (DB, error) {
+	var opt Options
+	if len(options) == 0 {
+		opt = Options{
+			Replicas: 2,
+			Port:     DefaultPort + int(time.Now().Unix()%9999),
+		}
+	} else {
+		opt = options[0]
 	}
-	return db
+	return NewDB(opt)
 }
 
 type DBTestSuite struct {
@@ -151,9 +151,10 @@ func (d *DBTestSuite) TestTopologyChangesForIndex() {
 		[]string{"Author"},
 	}
 
-	node := startSingle().(*cluster)
+	node, _ := startSingle()
+	nc := node.(*cluster)
 	v1 := time.Now().Unix()
-	node.storage.CreateIndex(internal.IdxMeta{
+	nc.storage.CreateIndex(internal.IdxMeta{
 		index.Name,
 		index.Key,
 		index.JsonPath,
@@ -162,7 +163,7 @@ func (d *DBTestSuite) TestTopologyChangesForIndex() {
 	require.Equal(d.T(), 1, len(node.Indexes()))
 
 	// before join
-	idxes, _ := node.storage.Indexes()
+	idxes, _ := nc.storage.Indexes()
 	require.Equal(d.T(), idxes[0].Version, v1)
 
 	// create index in the cluster
@@ -171,18 +172,53 @@ func (d *DBTestSuite) TestTopologyChangesForIndex() {
 	require.Equal(d.T(), 5, len(c.members.Members()))
 
 	// join the cluster
-	node.members.Join([]string{fmt.Sprintf("0.0.0.0:%d", DefaultPort)})
+	nc.members.Join([]string{fmt.Sprintf("0.0.0.0:%d", DefaultPort)})
 	time.Sleep(100 * time.Microsecond)
 	require.Equal(d.T(), 6, len(c.members.Members()))
 	require.Equal(d.T(), 1, len(node.Indexes()))
 
 	// after join
-	idxes, _ = node.storage.Indexes()
+	idxes, _ = nc.storage.Indexes()
 	require.True(d.T(), idxes[0].Version > v1)
 	oidxes, _ := c.storage.Indexes()
 	require.Equal(d.T(), idxes[0].Version, oidxes[0].Version)
 }
 
+func (suite *DBTestSuite) TestTopologyChangesJoin() {
+	tests := []struct {
+		name string
+		opt  Options
+	}{
+		{
+			name: "inconsistent replicas",
+			opt:  Options{Replicas: 3},
+		},
+		{
+			name: "inconsistent partitions",
+			opt:  Options{Partitions: 666},
+		},
+		{
+			name: "inconsistent timeout",
+			opt:  Options{Timeout: 2 * time.Second},
+		},
+		{
+			name: "inconsistent retry",
+			opt:  Options{Retry: 8},
+		},
+	}
+	for _, test := range tests {
+		opt := test.opt
+		opt.Port = 8080 + int(time.Now().Unix()%99)
+		suite.Run(test.name, func() {
+			node, err := startSingle(opt)
+			require.NoError(suite.T(), err)
+			c := node.(*cluster)
+			_, err = c.members.Join([]string{fmt.Sprintf("0.0.0.0:%d", DefaultPort)})
+			require.Error(suite.T(), err)
+			node.Shutdown()
+		})
+	}
+}
 func (suite *DBTestSuite) TestSetAndGet() {
 	keys := []string{
 		fmt.Sprintf("k1%s", strconv.FormatUint(rand.Uint64(), 10)),
@@ -215,27 +251,27 @@ func (suite *DBTestSuite) TestSetAndGet() {
 		},
 	}
 	for _, test := range tests {
-		suite.T().Run(test.name, func(t *testing.T) {
+		suite.Run(test.name, func() {
 			err := test.node.Set(test.key, test.value)
-			require.NoError(t, err)
+			require.NoError(suite.T(), err)
 			time.Sleep(500 * time.Microsecond)
 			// assert key's existence in internal storage
 			lo.ForEach(suite.Replicas(test.key), func(c *cluster, _ int) {
 				v1, _, err1 := c.storage.Get(test.key)
-				require.NoError(t, err1)
-				require.Equal(t, test.value, v1)
+				require.NoError(suite.T(), err1)
+				require.Equal(suite.T(), test.value, v1)
 				v1, _, err1 = c.Get(test.key)
-				require.NoError(t, err1, "should get value from any node")
-				require.Equal(t, test.value, v1)
+				require.NoError(suite.T(), err1, "should get value from any node")
+				require.Equal(suite.T(), test.value, v1)
 			})
 			// assert key should not in none-replicas
 			lo.ForEach(suite.NoneReplicas(test.key), func(c *cluster, _ int) {
 				v1, _, err1 := c.storage.Get(test.key)
-				require.Error(t, err1, "key should not in the none-replicas")
-				require.Equal(t, "", v1)
+				require.Error(suite.T(), err1, "key should not in the none-replicas")
+				require.Equal(suite.T(), "", v1)
 				v1, _, err1 = c.Get(test.key)
-				require.NoError(t, err1, "should get value from any node")
-				require.Equal(t, test.value, v1)
+				require.NoError(suite.T(), err1, "should get value from any node")
+				require.Equal(suite.T(), test.value, v1)
 			})
 		})
 	}
@@ -343,10 +379,10 @@ func (suite *DBTestSuite) TestSearchIndex() {
 	}
 
 	for _, test := range tests {
-		suite.T().Run(test.name, func(t *testing.T) {
+		suite.Run(test.name, func() {
 			rsm, err := suite.nodes[0].Search(test.index, test.criteria)
-			require.NoError(t, err)
-			require.Equal(t, len(test.result), len(rsm))
+			require.NoError(suite.T(), err)
+			require.Equal(suite.T(), len(test.result), len(rsm))
 		})
 	}
 

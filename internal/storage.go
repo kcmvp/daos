@@ -13,7 +13,6 @@ import (
 	"time"
 )
 
-const defaultPartitionCount = 1001
 const indexIndexName = "_meta_"
 const indexKeyPrefix = "_idx_:"
 const indexVersion = "version"
@@ -195,7 +194,7 @@ func (s *Storage) MergeRemoteState(indexes []IdxMeta, join bool) {
 
 	})
 }
-func NewStorage(replicas int, logger *log.Logger) (*Storage, error) {
+func NewStorage(replicas int, logger *log.Logger, partitions int) (*Storage, error) {
 	db, err := buntdb.Open(":memory:")
 	if err != nil {
 		logger.Printf("failed to create db %s \n", err.Error())
@@ -212,7 +211,7 @@ func NewStorage(replicas int, logger *log.Logger) (*Storage, error) {
 		logger:   logger,
 		DB:       db,
 		Consistent: consistent.New(nil, consistent.Config{
-			PartitionCount: defaultPartitionCount,
+			PartitionCount: partitions,
 			Hasher:         &hash{},
 		}),
 	}
