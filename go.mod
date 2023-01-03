@@ -12,7 +12,6 @@ require (
 	github.com/stretchr/testify v1.8.1
 	github.com/tidwall/buntdb v1.2.10
 	github.com/vmihailenco/msgpack/v5 v5.3.5
-	go.uber.org/zap v1.17.0
 )
 
 require (
@@ -70,8 +69,6 @@ require (
 	github.com/tidwall/tinyqueue v0.1.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/xanzy/ssh-agent v0.3.0 // indirect
-	go.uber.org/atomic v1.10.0 // indirect
-	go.uber.org/multierr v1.8.0 // indirect
 	golang.org/x/crypto v0.1.0 // indirect
 	golang.org/x/exp v0.0.0-20221227203929-1b447090c38c // indirect
 	golang.org/x/mod v0.6.0 // indirect

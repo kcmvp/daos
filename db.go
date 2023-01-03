@@ -87,7 +87,7 @@ func NewDB(options Options) (DB, error) {
 		storage: storage,
 		options: options,
 	}
-	cfg.Events = &event{storage}
+	cfg.Events = &event{storage, cfg.Logger}
 	cfg.Delegate = c
 	members, err := memberlist.Create(cfg)
 	if err != nil {

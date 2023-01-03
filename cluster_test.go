@@ -78,7 +78,7 @@ func (suite *DBTestSuite) AfterTest(_, method string) {
 	}
 }
 
-func TestDbSuit(t *testing.T) {
+func TestDbCluster(t *testing.T) {
 	suite.Run(t, new(DBTestSuite))
 }
 

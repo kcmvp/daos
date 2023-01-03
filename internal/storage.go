@@ -34,9 +34,9 @@ type IdxMeta struct {
 }
 
 type Storage struct {
-	db       *buntdb.DB
 	replicas int
 	logger   *log.Logger
+	*buntdb.DB
 	*consistent.Consistent
 }
 
@@ -48,7 +48,7 @@ type Row struct {
 
 func (s *Storage) Set(k, v string, ttl time.Duration) error {
 	var err error
-	s.db.Update(func(tx *buntdb.Tx) error {
+	s.Update(func(tx *buntdb.Tx) error {
 		if ttl > 0 {
 			_, _, err = tx.Set(k, v, &buntdb.SetOptions{Expires: true, TTL: ttl})
 		} else {
@@ -60,7 +60,7 @@ func (s *Storage) Set(k, v string, ttl time.Duration) error {
 }
 
 func (s *Storage) Get(k string) (v string, ttl time.Duration, err error) {
-	s.db.View(func(tx *buntdb.Tx) error {
+	s.View(func(tx *buntdb.Tx) error {
 		v, err = tx.Get(k, false)
 		if err != nil {
 			return err
@@ -77,7 +77,7 @@ func (s *Storage) Get(k string) (v string, ttl time.Duration, err error) {
 func (s *Storage) Ttl(k string) (time.Duration, error) {
 	var ttl time.Duration
 	var err error
-	s.db.View(func(tx *buntdb.Tx) error {
+	s.View(func(tx *buntdb.Tx) error {
 		ttl, err = tx.TTL(k)
 		return err
 	})
@@ -86,7 +86,7 @@ func (s *Storage) Ttl(k string) (time.Duration, error) {
 
 func (s *Storage) SearchIndex(index, criteria string) []Row {
 	var rows []Row
-	s.db.View(func(tx *buntdb.Tx) error {
+	s.View(func(tx *buntdb.Tx) error {
 		tx.AscendEqual(index, criteria, func(key, value string) bool {
 			ttl, _ := tx.TTL(key)
 			r := Row{
@@ -104,7 +104,7 @@ func (s *Storage) SearchIndex(index, criteria string) []Row {
 
 func (s *Storage) ScanIndex(index, indexPrefix string) []Row {
 	var resp []Row
-	s.db.View(func(tx *buntdb.Tx) error {
+	s.View(func(tx *buntdb.Tx) error {
 		tx.Ascend(index, func(key, value string) bool {
 			if strings.HasPrefix(key, indexPrefix) {
 				ttl, _ := tx.TTL(key)
@@ -123,7 +123,7 @@ func (s *Storage) ScanIndex(index, indexPrefix string) []Row {
 }
 
 func (s *Storage) Del(k string) (v string, err error) {
-	s.db.Update(func(tx *buntdb.Tx) error {
+	s.Update(func(tx *buntdb.Tx) error {
 		v, err = tx.Delete(k)
 		return nil
 	})
@@ -133,7 +133,7 @@ func (s *Storage) Del(k string) (v string, err error) {
 func (s *Storage) Indexes() ([]IdxMeta, int) {
 	var indexes []IdxMeta
 	var size int
-	s.db.View(func(tx *buntdb.Tx) error {
+	s.View(func(tx *buntdb.Tx) error {
 		tx.Ascend(indexIndexName, func(k, v string) bool {
 			index := IdxMeta{}
 			size += len(v)
@@ -148,7 +148,7 @@ func (s *Storage) Indexes() ([]IdxMeta, int) {
 
 func (s *Storage) CreateIndex(index IdxMeta) error {
 	var err error
-	err = s.db.Update(func(tx *buntdb.Tx) error {
+	err = s.Update(func(tx *buntdb.Tx) error {
 		//var data []byte
 		jsonIndex := lo.Map[string, func(a, b string) bool](index.JsonPath, func(p string, _ int) func(a, b string) bool {
 			return buntdb.IndexJSON(p)
@@ -169,7 +169,7 @@ func (s *Storage) CreateIndex(index IdxMeta) error {
 
 func (s *Storage) DropIndex(name string) error {
 	var err error
-	err = s.db.Update(func(tx *buntdb.Tx) error {
+	err = s.Update(func(tx *buntdb.Tx) error {
 		err = tx.DropIndex(name)
 		if err != nil {
 			return err
@@ -217,9 +217,9 @@ func NewStorage(replicas int, logger *log.Logger) (*Storage, error) {
 		panic(fmt.Sprintf("failed to init database %s", err.Error()))
 	}
 	s := &Storage{
-		db:       db,
 		replicas: replicas,
 		logger:   logger,
+		DB:       db,
 		Consistent: consistent.New(nil, consistent.Config{
 			PartitionCount: defaultPartitionCount,
 			Hasher:         &hash{},
