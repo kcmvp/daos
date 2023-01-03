@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/brianvoe/gofakeit/v6"
 	"github.com/hashicorp/memberlist"
+	"github.com/kcmvp/daos/internal"
 	"github.com/samber/lo"
 	lop "github.com/samber/lo/parallel"
 	"github.com/stretchr/testify/require"
@@ -33,7 +34,7 @@ func (b Book) Key() string {
 	return fmt.Sprintf("b:%s", b.Name)
 }
 
-func startNodes(num int) []DB {
+func startCluster(num int) []DB {
 	var dbs []DB
 	var existing []string
 	for i := 0; i < num; i++ {
@@ -51,6 +52,18 @@ func startNodes(num int) []DB {
 	}
 	return dbs
 }
+func startSingle() DB {
+	var db DB
+	var err error
+	random := time.Now().Unix() % 100
+	if db, err = NewDB(Options{
+		Port:     DefaultPort + int(random),
+		Replicas: 2,
+	}); err != nil {
+		log.Fatalf("failed to start the cluster %s", err.Error())
+	}
+	return db
+}
 
 type DBTestSuite struct {
 	suite.Suite
@@ -58,7 +71,7 @@ type DBTestSuite struct {
 }
 
 func (suite *DBTestSuite) SetupSuite() {
-	suite.nodes = startNodes(5)
+	suite.nodes = startCluster(5)
 }
 
 func (suite *DBTestSuite) TearDownSuite() {
@@ -128,6 +141,46 @@ func (suite *DBTestSuite) TestCluster() {
 		})
 		require.True(suite.T(), ok)
 	})
+}
+
+func (d *DBTestSuite) TestTopologyChangesForIndex() {
+	c := d.nodes[0].(*cluster)
+	index := Index{
+		fmt.Sprintf("idx%d", time.Now().Unix()),
+		"b:*",
+		[]string{"Author"},
+	}
+
+	node := startSingle().(*cluster)
+	v1 := time.Now().Unix()
+	node.storage.CreateIndex(internal.IdxMeta{
+		index.Name,
+		index.Key,
+		index.JsonPath,
+		v1,
+	})
+	require.Equal(d.T(), 1, len(node.Indexes()))
+
+	// before join
+	idxes, _ := node.storage.Indexes()
+	require.Equal(d.T(), idxes[0].Version, v1)
+
+	// create index in the cluster
+	c.CreateJsonIndex(index)
+	require.Equal(d.T(), 1, len(c.Indexes()))
+	require.Equal(d.T(), 5, len(c.members.Members()))
+
+	// join the cluster
+	node.members.Join([]string{fmt.Sprintf("0.0.0.0:%d", DefaultPort)})
+	time.Sleep(100 * time.Microsecond)
+	require.Equal(d.T(), 6, len(c.members.Members()))
+	require.Equal(d.T(), 1, len(node.Indexes()))
+
+	// after join
+	idxes, _ = node.storage.Indexes()
+	require.True(d.T(), idxes[0].Version > v1)
+	oidxes, _ := c.storage.Indexes()
+	require.Equal(d.T(), idxes[0].Version, oidxes[0].Version)
 }
 
 func (suite *DBTestSuite) TestSetAndGet() {

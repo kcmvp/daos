@@ -145,7 +145,6 @@ func (s *Storage) Indexes() ([]IdxMeta, int) {
 	})
 	return indexes, size
 }
-
 func (s *Storage) CreateIndex(index IdxMeta) error {
 	var err error
 	err = s.Update(func(tx *buntdb.Tx) error {
@@ -181,28 +180,20 @@ func (s *Storage) DropIndex(name string) error {
 }
 
 func (s *Storage) MergeRemoteState(indexes []IdxMeta, join bool) {
-	var existing []IdxMeta
 	lo.ForEach(indexes, func(item IdxMeta, _ int) {
 		v, _, err := s.Get(fmt.Sprintf("%s%s", indexKeyPrefix, item.Name))
 		var idx IdxMeta
 		if err == nil {
 			json.Unmarshal([]byte(v), &idx)
-			existing = append(existing, idx)
+			if idx.Version < item.Version {
+				s.DropIndex(item.Name)
+				s.CreateIndex(item)
+			}
+		} else {
+			s.CreateIndex(item)
 		}
-	})
-	var update []IdxMeta
-	lo.ForEach(indexes, func(r IdxMeta, _ int) {
-		f := lo.ContainsBy(existing, func(e IdxMeta) bool {
-			return r.Name == e.Name && r.Version <= e.Version
-		})
-		if !f {
-			update = append(update, r)
-		}
-	})
-	lo.ForEach(update, func(i IdxMeta, _ int) {
-		s.CreateIndex(i)
-	})
 
+	})
 }
 func NewStorage(replicas int, logger *log.Logger) (*Storage, error) {
 	db, err := buntdb.Open(":memory:")
