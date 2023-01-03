@@ -54,7 +54,7 @@ type DB interface {
 	CreateJsonIndex(index Index) error
 	DropIndex(name string) error
 	Indexes() []Index
-	Search(index string, by string) (map[string]string, error)
+	Search(index string, exp string) (map[string]string, error)
 	Shutdown()
 }
 

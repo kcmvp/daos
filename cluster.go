@@ -48,7 +48,7 @@ var handlers = map[action]Handler{
 	del:         delHandler,
 	get:         getHandler,
 	getResp:     getRespHandler,
-	search:      setHandler,
+	search:      searchHandler,
 	searchResp:  searchRespHandler,
 	createIndex: createIndexHandler,
 	dropIndex:   dropIndexHandler,
@@ -237,7 +237,7 @@ func (dc *cluster) Get(k string) (string, time.Duration, error) {
 				dc.Logger().Printf("error: redirect times out %d microseconds\n ", t/time.Microsecond)
 				close(ch)
 			} else {
-				dc.Logger().Printf("redirect elapse %d microseconds", t/time.Microsecond)
+				dc.Logger().Printf("get redirect elapse %d microseconds", t/time.Microsecond)
 			}
 			if len(r) > 0 {
 				var e error
@@ -269,12 +269,13 @@ func (dc *cluster) Del(k string) (err error) {
 	return
 }
 
-func (dc *cluster) Search(index, criteria string) (map[string]string, error) {
+func (dc *cluster) Search(index, exp string) (map[string]string, error) {
+	//@todo valid jsonExp is valid or not
 	// send search request to the dc
 	cmd := Command{
 		Action: search,
 		Index:  index,
-		Value:  criteria,
+		Value:  exp,
 		Caller: dc.LocalNode(),
 		Seq:    rand.Uint32()}
 	data, _ := msgpack.Marshal(&cmd)
@@ -286,29 +287,31 @@ func (dc *cluster) Search(index, criteria string) (map[string]string, error) {
 	})
 	// get the result
 	return func(c Command) (map[string]string, error) {
+		// query local
+		var t3s []lo.Tuple3[string, string, string]
+		go func() {
+			local := dc.storage.SearchIndex(c.Index, c.Value)
+			t3s = lo.Map(local, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
+				return lo.T3(dc.LocalNode(), r.Key, r.Value)
+			})
+		}()
+		// send request to remote
 		ch, _ := dc.getChan(c.Seq)
-		remote, l, _, ok := lo.BufferWithTimeout(ch, dc.members.NumMembers()-1, dc.Timeout())
-		dc.delChan(c.Seq)
-		if ok {
+		defer func() {
 			close(ch)
-		}
-		if l != dc.members.NumMembers()-1 {
+		}()
+		resp, _, _, _ := lo.BufferWithTimeout(ch, dc.members.NumMembers()-1, dc.Timeout())
+		dc.delChan(c.Seq)
+		if len(resp) != dc.members.NumMembers()-1 {
 			return map[string]string{}, errors.New("can't get response from some nodes")
 		}
-		// query local
-		local := dc.storage.SearchIndex(c.Index, c.Value)
-		t3s := lo.Map(local, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
-			return lo.T3(dc.LocalNode(), r.Key, r.Value)
-		})
-		lop.ForEach(remote, func(item Command, _ int) {
-			if len(item.Value) > 0 {
-				var rows []internal.Row
-				msgpack.Unmarshal([]byte(item.Value), &rows)
-				a := lop.Map(rows, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
-					return lo.T3(item.Key, r.Key, r.Value)
-				})
-				t3s = append(t3s, a...)
-			}
+		lop.ForEach(resp, func(item Command, _ int) {
+			var rows []internal.Row
+			msgpack.Unmarshal([]byte(item.Value), &rows)
+			a := lo.Map(rows, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
+				return lo.T3(item.Key, r.Key, r.Value)
+			})
+			t3s = append(t3s, a...)
 		})
 
 		groups := lop.GroupBy(t3s, func(t3 lo.Tuple3[string, string, string]) int {
@@ -319,8 +322,17 @@ func (dc *cluster) Search(index, criteria string) (map[string]string, error) {
 				return 0
 			}
 		})
-		if len(groups) != 2 || len(groups[0]) != len(groups[1]) {
+		replicas := lo.SliceToMap(groups[0], func(t3 lo.Tuple3[string, string, string]) (string, string) {
+			return t3.B, t3.C
+		})
+		if len(groups) > 0 && len(groups) != 2 || len(replicas) > len(groups[1]) {
 			dc.Logger().Printf("error: data lost in replicas")
+			for k, v := range replicas {
+				fmt.Printf("00:%s,%s \n", k, v)
+			}
+			for _, v := range groups[0] {
+				fmt.Printf("11:%s,%s N:%s \n", v.B, v.C, v.A)
+			}
 			return map[string]string{}, errors.New("data lost in replicas")
 		}
 		return lo.SliceToMap(groups[1], func(t3 lo.Tuple3[string, string, string]) (string, string) {
