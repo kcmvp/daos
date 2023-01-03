@@ -5,6 +5,7 @@ import (
 	"github.com/hashicorp/memberlist"
 	"github.com/kcmvp/daos/internal"
 	"github.com/samber/lo"
+	"github.com/vmihailenco/msgpack/v5"
 	"log"
 	"os"
 	"time"
@@ -37,14 +38,15 @@ func (idx Index) Validate() error {
 
 type Options struct {
 	// Local address to bind to
-	Port int
+	Port int `json:",omitempty"`
 	// Nodes all the members in the cluster
-	Nodes []string
+	Nodes []string `json:",omitempty"`
 	// Replicas replication factor
-	Replicas int
-	Logger   *log.Logger
-	Timeout  time.Duration
-	Retry    int
+	Replicas   int           `json:"replicas"`
+	Logger     *log.Logger   `json:",omitempty"`
+	Timeout    time.Duration `json:"timeout"`
+	Retry      int           `json:"retry"`
+	Partitions int           `json:"partitions"`
 }
 
 type DB interface {
@@ -66,6 +68,9 @@ func NewDB(options Options) (DB, error) {
 	} else {
 		cfg.BindPort = DefaultPort
 	}
+	if options.Partitions < 1 {
+		options.Partitions = DefaultPartitions
+	}
 	// default retry times
 	if options.Retry < 1 {
 		options.Retry = 3
@@ -74,12 +79,12 @@ func NewDB(options Options) (DB, error) {
 		options.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
 	// default timeout is 4 * ProbeTimeout
-	if options.Timeout == 0 {
+	if options.Timeout < time.Millisecond {
 		options.Timeout = cfg.ProbeTimeout * 4
 	}
 	cfg.Logger = options.Logger
 	cfg.Name = fmt.Sprintf("%s-%d", cfg.Name, cfg.BindPort)
-	storage, err := internal.NewStorage(options.Replicas, cfg.Logger)
+	storage, err := internal.NewStorage(options.Replicas, cfg.Logger, options.Partitions)
 	if err != nil {
 		return nil, err
 	}
@@ -89,10 +94,15 @@ func NewDB(options Options) (DB, error) {
 	}
 	cfg.Events = &event{storage, cfg.Logger}
 	cfg.Delegate = c
+	md := &merge{}
+	cfg.Merge = md
 	members, err := memberlist.Create(cfg)
 	if err != nil {
 		return nil, err
 	}
+	meta, _ := msgpack.Marshal(options)
+	members.LocalNode().Meta = meta
+	md.meta = meta
 	// add db to db
 	if len(options.Nodes) > 0 {
 		members.Join(options.Nodes)
