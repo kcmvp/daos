@@ -65,9 +65,7 @@ type cluster struct {
 func (dc *cluster) Logger() *log.Logger {
 	return dc.options.Logger
 }
-func (dc *cluster) Timeout() time.Duration {
-	return dc.options.Timeout
-}
+
 func (dc *cluster) Shutdown() {
 	dc.members.Shutdown()
 }
@@ -106,6 +104,12 @@ func (dc *cluster) NodeByName(name string) (*memberlist.Node, error) {
 	} else {
 		return nil, fmt.Errorf("can not find the dc %s", name)
 	}
+}
+
+func (dc *cluster) Nodes() []string {
+	return lo.Map(dc.members.Members(), func(item *memberlist.Node, _ int) string {
+		return item.Name
+	})
 }
 
 func (dc *cluster) GetBroadcasts(overhead, limit int) [][]byte {
@@ -186,7 +190,7 @@ func (dc *cluster) SetWithTtl(k, v string, ttl time.Duration) error {
 	if dc.Primary(k) {
 		if err = dc.storage.Set(k, v, ttl); err == nil {
 			lop.ForEach(replicas[1:], func(node *memberlist.Node, _ int) {
-				lo.AttemptWithDelay(3, dc.options.Timeout, func(i int, t time.Duration) error {
+				lo.AttemptWithDelay(dc.options.Retry, dc.options.Timeout, func(i int, t time.Duration) error {
 					err = dc.members.SendBestEffort(node, data)
 					if err != nil && i+1 < 3 {
 						dc.Logger().Printf("failed to send data to node %s, retry: %d \n", node.Name, i)
@@ -231,7 +235,7 @@ func (dc *cluster) Get(k string) (string, time.Duration, error) {
 		}()
 		return func(c Command) (string, time.Duration, error) {
 			ch, _ := dc.getChan(c.Seq)
-			r, _, t, ok := lo.BufferWithTimeout(ch, 2, dc.Timeout())
+			r, _, t, ok := lo.BufferWithTimeout(ch, 2, dc.options.Timeout)
 			dc.delChan(c.Seq)
 			if ok {
 				dc.Logger().Printf("error: redirect times out %d microseconds\n ", t/time.Microsecond)
@@ -257,7 +261,7 @@ func (dc *cluster) Del(k string) (err error) {
 	data, _ := msgpack.Marshal(cmd)
 	replicas, _ := dc.storage.Replicas(k)
 	lop.ForEach(replicas, func(node *memberlist.Node, _ int) {
-		_, _, err = lo.AttemptWithDelay(3, dc.Timeout(), func(tries int, time time.Duration) error {
+		_, _, err = lo.AttemptWithDelay(dc.options.Retry, dc.options.Timeout, func(tries int, time time.Duration) error {
 			if node.Name == dc.LocalNode() {
 				_, err = dc.storage.Del(k)
 			} else {
@@ -287,7 +291,7 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 	})
 	// get the result
 	return func(c Command) (map[string]string, error) {
-		// query local
+		// search local
 		var t3s []lo.Tuple3[string, string, string]
 		go func() {
 			local := dc.storage.SearchIndex(c.Index, c.Value)
@@ -300,12 +304,15 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 		defer func() {
 			close(ch)
 		}()
-		resp, _, _, _ := lo.BufferWithTimeout(ch, dc.members.NumMembers()-1, dc.Timeout())
+		resp, _, _, _ := lo.BufferWithTimeout(ch, dc.members.NumMembers()-1, dc.options.Timeout)
 		dc.delChan(c.Seq)
 		if len(resp) != dc.members.NumMembers()-1 {
-			return map[string]string{}, errors.New("can't get response from some nodes")
+			nodes := lo.Uniq(lo.Map(resp, func(item Command, _ int) string {
+				return item.Key
+			}))
+			return map[string]string{}, fmt.Errorf("can't get response from nodes: %+v", lo.Without(dc.Nodes(), nodes...))
 		}
-		lop.ForEach(resp, func(item Command, _ int) {
+		lo.ForEach(resp, func(item Command, _ int) {
 			var rows []internal.Row
 			msgpack.Unmarshal([]byte(item.Value), &rows)
 			a := lo.Map(rows, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
@@ -314,7 +321,7 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 			t3s = append(t3s, a...)
 		})
 
-		groups := lop.GroupBy(t3s, func(t3 lo.Tuple3[string, string, string]) int {
+		groups := lo.GroupBy(t3s, func(t3 lo.Tuple3[string, string, string]) int {
 			node, _ := dc.storage.Primary(t3.B)
 			if node.Name == t3.A {
 				return 1
@@ -325,8 +332,10 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 		replicas := lo.SliceToMap(groups[0], func(t3 lo.Tuple3[string, string, string]) (string, string) {
 			return t3.B, t3.C
 		})
-		if len(groups) > 0 && len(groups) != 2 || len(replicas) > len(groups[1]) {
-			dc.Logger().Printf("error: data lost in replicas")
+		if len(replicas) != len(groups[1]) {
+			//@todo need to find out the missing replica and send to node
+			dc.Logger().Printf("warning: data lost in replicas")
+			//@todo debug info
 			for k, v := range replicas {
 				fmt.Printf("00:%s,%s \n", k, v)
 			}
@@ -341,7 +350,7 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 	}(cmd)
 }
 
-func (dc *cluster) hasIndex(index string) bool {
+func (dc *cluster) existingIndex(index string) bool {
 	indexes, _ := dc.storage.Indexes()
 	return lo.ContainsBy(indexes, func(idx internal.IdxMeta) bool {
 		return idx.Name == index
@@ -357,9 +366,9 @@ func (dc *cluster) createJsonIndex(index internal.IdxMeta) error {
 	var failedNodes []string
 	lo.ForEach(dc.members.Members(), func(m *memberlist.Node, _ int) {
 		var err error
-		lo.AttemptWithDelay(3, dc.Timeout(), func(n int, t time.Duration) error {
+		lo.AttemptWithDelay(dc.options.Retry, dc.options.Timeout, func(n int, t time.Duration) error {
 			if m.Name == dc.LocalNode() {
-				if !dc.hasIndex(index.Name) {
+				if !dc.existingIndex(index.Name) {
 					err = dc.storage.CreateIndex(index)
 				} else {
 					dc.Logger().Printf("index %s exists, broadcast to other nodes\n", index.Name)
@@ -398,11 +407,11 @@ func (dc *cluster) DropIndex(name string) error {
 	lop.ForEach(dc.members.Members(), func(m *memberlist.Node, _ int) {
 		var err error
 		if m.Name == dc.LocalNode() {
-			if dc.hasIndex(name) {
+			if dc.existingIndex(name) {
 				err = dc.storage.DropIndex(name)
 			}
 		} else {
-			_, _, err = lo.AttemptWithDelay(3, dc.Timeout(), func(n int, t time.Duration) error {
+			_, _, err = lo.AttemptWithDelay(dc.options.Retry, dc.options.Timeout, func(n int, t time.Duration) error {
 				if err = dc.members.SendBestEffort(m, msg); err != nil {
 					dc.Logger().Printf("drip index %s, retry %d \n", name, n)
 					return err

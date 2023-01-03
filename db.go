@@ -44,6 +44,7 @@ type Options struct {
 	Replicas int
 	Logger   *log.Logger
 	Timeout  time.Duration
+	Retry    int
 }
 
 type DB interface {
@@ -59,11 +60,15 @@ type DB interface {
 }
 
 func NewDB(options Options) (DB, error) {
-	cfg := memberlist.DefaultLocalConfig()
+	cfg := memberlist.DefaultLANConfig()
 	if options.Port > 0 {
 		cfg.BindPort = options.Port
 	} else {
 		cfg.BindPort = DefaultPort
+	}
+	// default retry times
+	if options.Retry < 1 {
+		options.Retry = 3
 	}
 	if options.Logger == nil {
 		options.Logger = log.New(os.Stderr, "", log.LstdFlags)

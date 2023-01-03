@@ -48,7 +48,7 @@ var setHandler Handler = func(dc *cluster, cmd Command) {
 			// only issue set from primary
 			replicas, _ := dc.storage.Replicas(cmd.Key)
 			lop.ForEach(replicas[1:], func(n *memberlist.Node, _ int) {
-				lo.AttemptWithDelay(3, dc.Timeout(), func(try int, time time.Duration) error {
+				lo.AttemptWithDelay(dc.options.Retry, dc.options.Timeout, func(try int, time time.Duration) error {
 					return dc.members.SendBestEffort(n, msg)
 				})
 			})

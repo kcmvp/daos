@@ -8,7 +8,7 @@ import (
 var createIndexHandler Handler = func(dc *cluster, cmd Command) {
 	var idx internal.IdxMeta
 	if err := msgpack.Unmarshal([]byte(cmd.Value), &idx); err == nil {
-		if !dc.hasIndex(idx.Name) {
+		if !dc.existingIndex(idx.Name) {
 			if err = dc.storage.CreateIndex(idx); err != nil {
 				dc.Logger().Printf("error: failed to create index %s: %+v", idx.Name, err.Error())
 			} else {
@@ -21,7 +21,7 @@ var createIndexHandler Handler = func(dc *cluster, cmd Command) {
 }
 
 var dropIndexHandler Handler = func(dc *cluster, cmd Command) {
-	if dc.hasIndex(cmd.Value) {
+	if dc.existingIndex(cmd.Value) {
 		if err := dc.storage.DropIndex(cmd.Value); err != nil {
 			dc.Logger().Printf("failed to drop index  %s on node %s: %+v", cmd.Value, dc.LocalNode(), err)
 		}
