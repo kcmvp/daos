@@ -129,6 +129,7 @@ func (dc *cluster) MergeRemoteState(buf []byte, join bool) {
 		dc.Logger().Printf("failed to unmarshal index data %s \n", err.Error())
 		return
 	}
+	dc.Logger().Printf("starting merge remote state")
 	dc.storage.MergeRemoteState(indexes, join)
 }
 
@@ -350,7 +351,7 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 	}(cmd)
 }
 
-func (dc *cluster) existingIndex(index string) bool {
+func (dc *cluster) hasIndex(index string) bool {
 	indexes, _ := dc.storage.Indexes()
 	return lo.ContainsBy(indexes, func(idx internal.IdxMeta) bool {
 		return idx.Name == index
@@ -368,7 +369,7 @@ func (dc *cluster) createJsonIndex(index internal.IdxMeta) error {
 		var err error
 		lo.AttemptWithDelay(dc.options.Retry, dc.options.Timeout, func(n int, t time.Duration) error {
 			if m.Name == dc.LocalNode() {
-				if !dc.existingIndex(index.Name) {
+				if !dc.hasIndex(index.Name) {
 					err = dc.storage.CreateIndex(index)
 				}
 			} else {
@@ -405,7 +406,7 @@ func (dc *cluster) DropIndex(name string) error {
 	lop.ForEach(dc.members.Members(), func(m *memberlist.Node, _ int) {
 		var err error
 		if m.Name == dc.LocalNode() {
-			if dc.existingIndex(name) {
+			if dc.hasIndex(name) {
 				err = dc.storage.DropIndex(name)
 			}
 		} else {
