@@ -22,8 +22,15 @@ type Book struct {
 	Name      string `faker:"word,unique"`
 	Date      sql.NullTime
 	Author    string `fake:"{randomstring:[aa,ab]}"`
-	Publisher string `fake:"{randomstring:[pa,pb]}"`
-	Price     int
+	Publisher struct {
+		Name string `fake:"{randomstring:[pa,pb]}"`
+		City string `fake:"{city}"`
+	}
+	Price int
+}
+
+func (b Book) Key() string {
+	return fmt.Sprintf("b:%s", b.Name)
 }
 
 func startNodes(num int) []DB {
@@ -233,14 +240,14 @@ func (suite *DBTestSuite) TestCreateDropIndex() {
 }
 
 func (suite *DBTestSuite) TestSearchIndex() {
+	bookIndex := "bookIndex"
 	suite.nodes[0].CreateJsonIndex(Index{
-		"booIndex",
+		bookIndex,
 		"b:*",
-		[]string{"author"},
+		[]string{"Author"},
 	})
 	time.Sleep(100 * time.Microsecond)
 	lo.ForEach(suite.nodes, func(db DB, _ int) {
-		fmt.Println(len(db.Indexes()))
 		require.Equal(suite.T(), 1, len(db.Indexes()))
 	})
 	books := lo.Times[Book](20, func(_ int) Book {
@@ -251,6 +258,43 @@ func (suite *DBTestSuite) TestSearchIndex() {
 	})
 	lo.ForEach(books, func(b Book, _ int) {
 		str, _ := json.Marshal(b)
-		suite.nodes[0].(*cluster).Set(fmt.Sprintf("b:%s", b.Name), string(str))
+		suite.nodes[0].(*cluster).Set(b.Key(), string(str))
 	})
+	lo.ForEach(books, func(b Book, _ int) {
+		v, _, err := suite.nodes[0].Get(b.Key())
+		require.NoError(suite.T(), err)
+		require.NotEmpty(suite.T(), v)
+	})
+
+	gba := lo.GroupBy(books, func(b Book) string {
+		return b.Author
+	})
+	tests := []struct {
+		name     string
+		index    string
+		criteria string
+		result   []Book
+	}{
+		{
+			name:     "Author=aa",
+			index:    bookIndex,
+			criteria: `{"Author":"aa"}`,
+			result:   gba["aa"],
+		},
+		{
+			name:     "empty result",
+			index:    bookIndex,
+			criteria: `{"Author":"cc"}`,
+			result:   gba["cc"],
+		},
+	}
+
+	for _, test := range tests {
+		suite.T().Run(test.name, func(t *testing.T) {
+			rsm, err := suite.nodes[0].Search(test.index, test.criteria)
+			require.NoError(t, err)
+			require.Equal(t, len(test.result), len(rsm))
+		})
+	}
+
 }
