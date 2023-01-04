@@ -304,11 +304,9 @@ func (suite *DBTestSuite) TestSetAndDel() {
 		}
 		err = d.(*cluster).Del(keys[idx])
 		require.NoError(suite.T(), err)
-		//time.Sleep(200 * time.Microsecond)
+		// @todo happens sporadic
+		time.Sleep(10 * time.Microsecond)
 		v, _, err = d.(*cluster).Get(keys[idx])
-		if err == nil {
-			fmt.Printf("vv: %s \n", v)
-		}
 		require.Error(suite.T(), err)
 	})
 }

@@ -1,7 +1,6 @@
 package daos
 
 import (
-	"errors"
 	"fmt"
 	"github.com/hashicorp/memberlist"
 	"github.com/kcmvp/daos/internal"
@@ -294,12 +293,13 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 	// get the result
 	return func(c Command) (map[string]string, error) {
 		// search local
-		var t3s []lo.Tuple3[string, string, string]
+		result := map[string]string{}
 		go func() {
 			local := dc.storage.SearchIndex(c.Index, c.Value)
-			t3s = lo.Map(local, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
-				return lo.T3(dc.LocalNode(), r.Key, r.Value)
+			m := lo.SliceToMap(local, func(r internal.Row) (string, string) {
+				return r.Key, r.Value
 			})
+			result = lo.Assign(result, m)
 		}()
 		// send request to remote
 		ch, _ := dc.getChan(c.Seq)
@@ -317,38 +317,11 @@ func (dc *cluster) Search(index, exp string) (map[string]string, error) {
 		lo.ForEach(resp, func(item Command, _ int) {
 			var rows []internal.Row
 			msgpack.Unmarshal([]byte(item.Value), &rows)
-			a := lo.Map(rows, func(r internal.Row, _ int) lo.Tuple3[string, string, string] {
-				return lo.T3(item.Key, r.Key, r.Value)
-			})
-			t3s = append(t3s, a...)
+			result = lo.Assign(result, lo.SliceToMap(rows, func(r internal.Row) (string, string) {
+				return r.Key, r.Value
+			}))
 		})
-
-		groups := lo.GroupBy(t3s, func(t3 lo.Tuple3[string, string, string]) int {
-			node, _ := dc.storage.Primary(t3.B)
-			if node.Name == t3.A {
-				return 1
-			} else {
-				return 0
-			}
-		})
-		replicas := lo.SliceToMap(groups[0], func(t3 lo.Tuple3[string, string, string]) (string, string) {
-			return t3.B, t3.C
-		})
-		if len(replicas) != len(groups[1]) {
-			//@todo need to find out the missing replica and send to node
-			dc.Logger().Printf("warning: data losts in replicas")
-			//@todo debug info
-			for k, v := range replicas {
-				fmt.Printf("00:%s,%s \n", k, v)
-			}
-			for _, v := range groups[0] {
-				fmt.Printf("11:%s,%s N:%s \n", v.B, v.C, v.A)
-			}
-			return map[string]string{}, errors.New("data lost in replicas")
-		}
-		return lo.SliceToMap(groups[1], func(t3 lo.Tuple3[string, string, string]) (string, string) {
-			return t3.B, t3.C
-		}), nil
+		return result, nil
 	}(cmd)
 }
 

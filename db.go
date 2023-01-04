@@ -84,7 +84,7 @@ func NewDB(options Options) (DB, error) {
 	}
 	cfg.Logger = options.Logger
 	cfg.Name = fmt.Sprintf("%s-%d", cfg.Name, cfg.BindPort)
-	storage, err := internal.NewStorage(options.Replicas, cfg.Logger, options.Partitions)
+	storage, err := internal.NewStorage(cfg.Name, options.Replicas, options.Partitions, cfg.Logger)
 	if err != nil {
 		return nil, err
 	}
