@@ -33,6 +33,7 @@ type IdxMeta struct {
 }
 
 type Storage struct {
+	name     string
 	replicas int
 	logger   *log.Logger
 	*buntdb.DB
@@ -87,13 +88,16 @@ func (s *Storage) SearchIndex(index, criteria string) []Row {
 	var rows []Row
 	s.View(func(tx *buntdb.Tx) error {
 		tx.AscendEqual(index, criteria, func(key, value string) bool {
-			ttl, _ := tx.TTL(key)
-			r := Row{
-				Key:   key,
-				Value: value,
-				TTL:   ttl,
+			// filter out replicas
+			if primary, err := s.Primary(key); err == nil && primary.Name == s.name {
+				ttl, _ := tx.TTL(key)
+				r := Row{
+					Key:   key,
+					Value: value,
+					TTL:   ttl,
+				}
+				rows = append(rows, r)
 			}
-			rows = append(rows, r)
 			return true
 		})
 		return nil
@@ -194,7 +198,7 @@ func (s *Storage) MergeRemoteState(indexes []IdxMeta, join bool) {
 
 	})
 }
-func NewStorage(replicas int, logger *log.Logger, partitions int) (*Storage, error) {
+func NewStorage(name string, replicas, partitions int, logger *log.Logger) (*Storage, error) {
 	db, err := buntdb.Open(":memory:")
 	if err != nil {
 		logger.Printf("failed to create db %s \n", err.Error())
@@ -207,6 +211,7 @@ func NewStorage(replicas int, logger *log.Logger, partitions int) (*Storage, err
 		panic(fmt.Sprintf("failed to init database %s", err.Error()))
 	}
 	s := &Storage{
+		name:     name,
 		replicas: replicas,
 		logger:   logger,
 		DB:       db,
