@@ -46,6 +46,10 @@ type Row struct {
 	TTL   time.Duration `json:"t,omitempty"`
 }
 
+func (s *Storage) Name() string {
+	return s.name
+}
+
 func (s *Storage) Set(k, v string, ttl time.Duration) error {
 	var err error
 	s.Update(func(tx *buntdb.Tx) error {

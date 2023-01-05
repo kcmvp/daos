@@ -8,16 +8,16 @@ import (
 	"github.com/hashicorp/memberlist"
 	"github.com/kcmvp/daos/internal"
 	"github.com/samber/lo"
-	lop "github.com/samber/lo/parallel"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"log"
 	"math/rand"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 )
+
+var firstNode = fmt.Sprintf("0.0.0.0:%d", DefaultPort)
 
 type Book struct {
 	Name      string `faker:"word,unique"`
@@ -70,7 +70,7 @@ type DBTestSuite struct {
 	nodes []DB
 }
 
-func (suite *DBTestSuite) SetupSuite() {
+func (suite *DBTestSuite) SetupTest() {
 	suite.nodes = startCluster(5)
 }
 
@@ -81,14 +81,9 @@ func (suite *DBTestSuite) TearDownSuite() {
 }
 
 func (suite *DBTestSuite) AfterTest(_, method string) {
-	if strings.HasSuffix(method, "Index") {
-		lop.ForEach(suite.nodes, func(db DB, _ int) {
-			lop.ForEach(db.Indexes(), func(idx Index, _ int) {
-				db.DropIndex(idx.Name)
-			})
-			require.Equal(suite.T(), 0, len(db.Indexes()))
-		})
-	}
+	lo.ForEach(suite.nodes, func(db DB, _ int) {
+		db.Shutdown()
+	})
 }
 
 func TestDbCluster(t *testing.T) {
@@ -218,6 +213,19 @@ func (suite *DBTestSuite) TestTopologyChangesJoin() {
 			node.Shutdown()
 		})
 	}
+}
+
+func (suite *DBTestSuite) TestTopologyChangesLeave() {
+	fmt.Println("node is going to join")
+	node, _ := startSingle()
+	// @todo happens sporadic node is nill
+	c := node.(*cluster)
+	_, err := c.members.Join([]string{firstNode})
+	require.NoError(suite.T(), err)
+	require.Equal(suite.T(), 6, c.members.NumMembers())
+	err = c.members.Leave(1 * time.Second)
+	require.NoError(suite.T(), err)
+	time.Sleep(1 * time.Second)
 }
 func (suite *DBTestSuite) TestSetAndGet() {
 	keys := []string{
