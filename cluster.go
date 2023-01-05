@@ -92,7 +92,6 @@ func (dc *cluster) GetBroadcasts(overhead, limit int) [][]byte {
 }
 
 func (dc *cluster) LocalState(join bool) []byte {
-
 	indexes, _ := dc.storage.Indexes()
 	data, _ := msgpack.Marshal(indexes)
 	return data
